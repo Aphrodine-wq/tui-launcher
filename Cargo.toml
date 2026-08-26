@@ -1,0 +1,23 @@
+[package]
+name = "tui-launcher"
+version = "0.1.0"
+edition = "2024"
+description = "A five-column terminal application launcher for Linux desktops"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.29"
+freedesktop-desktop-entry = { version = "0.8.1", default-features = false }
+freedesktop-icons = "0.4.0"
+image = { version = "0.25.10", default-features = false, features = ["ico", "jpeg", "png", "webp"] }
+ratatui = "0.30.2"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
+resvg = { version = "0.48.1", default-features = false, features = ["raster-images", "svgz", "text", "system-fonts"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true
