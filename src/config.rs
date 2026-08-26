@@ -36,6 +36,7 @@ pub struct Settings {
     pub reduced_motion: bool,
     pub network_artwork: bool,
     pub default_fullscreen: bool,
+    pub background_image: Option<PathBuf>,
     pub media_paths: Vec<PathBuf>,
     pub controller: ControllerBindings,
 }
@@ -64,6 +65,7 @@ impl Default for Settings {
             reduced_motion: false,
             network_artwork: false,
             default_fullscreen: false,
+            background_image: None,
             media_paths: default_media_paths(),
             controller: ControllerBindings::default(),
         }

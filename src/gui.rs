@@ -19,11 +19,34 @@ use crate::{
     config::{PersistentState, Settings, paths},
     feedback::{AudioFeedback, Tone},
     input::{ControllerInput, InputAction},
-    model::{Action, AppState, LibraryItem, Mode, SettingAction},
+    model::{Action, AppState, LibraryItem, Mode, SettingAction, SettingsGroup},
     platform, sources,
 };
 
 const FRAME_TIME: Duration = Duration::from_millis(16);
+
+/// Texture resolution tier. Icons get a small CPU-downscaled texture so they
+/// stay crisp at list size (the wgpu backend has no mipmaps); heroes and
+/// backgrounds get the large version.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum TextureTier {
+    Thumb,
+    Full,
+}
+
+struct SubMenu {
+    group: SettingsGroup,
+    items: Vec<LibraryItem>,
+    selection: usize,
+    position: f32,
+}
+
+enum OptionEntry {
+    Favorite,
+    Information,
+    SetBackground(PathBuf),
+    Close,
+}
 
 pub struct XmbApp {
     settings: Settings,
@@ -35,7 +58,9 @@ pub struct XmbApp {
     category_position: f32,
     item_positions: HashMap<Mode, f32>,
     wave_time: f32,
-    textures: HashMap<PathBuf, TextureHandle>,
+    textures: HashMap<(PathBuf, TextureTier), TextureHandle>,
+    submenu: Option<SubMenu>,
+    background_override: Option<PathBuf>,
     generated_art: HashMap<String, Option<PathBuf>>,
     art_pending: HashSet<String>,
     art_tx: Sender<(String, Option<PathBuf>)>,
@@ -59,6 +84,7 @@ impl XmbApp {
         migrated: bool,
         persisted: PersistentState,
         start: Mode,
+        background_override: Option<PathBuf>,
     ) -> Self {
         install_fonts(&creation.egui_ctx);
         creation.egui_ctx.set_visuals(egui::Visuals::dark());
@@ -100,6 +126,8 @@ impl XmbApp {
             audio,
             wave_time: 0.0,
             textures: HashMap::new(),
+            submenu: None,
+            background_override,
             generated_art: HashMap::new(),
             art_pending: HashSet::new(),
             art_tx,
@@ -135,6 +163,14 @@ impl XmbApp {
                 target
             } else {
                 ease(*current, target, dt, 15.0)
+            };
+        }
+        if let Some(submenu) = &mut self.submenu {
+            let target = submenu.selection as f32;
+            submenu.position = if self.settings.reduced_motion {
+                target
+            } else {
+                ease(submenu.position, target, dt, 15.0)
             };
         }
         self.state.controller_name = self.controller.name.clone();
@@ -221,6 +257,10 @@ impl XmbApp {
             self.handle_options_action(action);
             return;
         }
+        if self.submenu.is_some() {
+            self.handle_submenu_action(action);
+            return;
+        }
         match action {
             InputAction::PreviousMode => self.navigate_mode(-1),
             InputAction::NextMode => self.navigate_mode(1),
@@ -251,31 +291,62 @@ impl XmbApp {
         }
     }
 
+    fn option_entries(&self) -> Vec<(String, OptionEntry)> {
+        let mut entries = Vec::new();
+        let item = self.state.selected_item();
+        if !matches!(self.state.mode, Mode::Settings | Mode::Network) {
+            let favorite = item.is_some_and(|item| self.persisted.favorites.contains(&item.id));
+            entries.push((
+                if favorite {
+                    "Remove Favorite"
+                } else {
+                    "Add Favorite"
+                }
+                .to_owned(),
+                OptionEntry::Favorite,
+            ));
+        }
+        if self.state.mode == Mode::Photo
+            && let Some(Action::Open(path)) = item.map(|item| &item.action)
+        {
+            entries.push((
+                "Set as Background".to_owned(),
+                OptionEntry::SetBackground(path.clone()),
+            ));
+        }
+        entries.push(("Information".to_owned(), OptionEntry::Information));
+        entries.push(("Close".to_owned(), OptionEntry::Close));
+        entries
+    }
+
     fn handle_options_action(&mut self, action: InputAction) {
+        let entries = self.option_entries();
         match action {
             InputAction::PreviousItem => {
                 self.options_selection = self.options_selection.saturating_sub(1);
                 self.feedback(Tone::Navigate);
             }
             InputAction::NextItem => {
-                self.options_selection = (self.options_selection + 1).min(2);
+                self.options_selection =
+                    (self.options_selection + 1).min(entries.len().saturating_sub(1));
                 self.feedback(Tone::Navigate);
             }
-            InputAction::Confirm => match self.options_selection {
-                0 => {
-                    self.options_open = false;
-                    self.toggle_favorite();
+            InputAction::Confirm => {
+                self.options_open = false;
+                match entries
+                    .into_iter()
+                    .nth(self.options_selection)
+                    .map(|(_, entry)| entry)
+                {
+                    Some(OptionEntry::Favorite) => self.toggle_favorite(),
+                    Some(OptionEntry::Information) => {
+                        self.information_open = true;
+                        self.feedback(Tone::Confirm);
+                    }
+                    Some(OptionEntry::SetBackground(path)) => self.set_background(path),
+                    _ => self.feedback(Tone::Back),
                 }
-                1 => {
-                    self.options_open = false;
-                    self.information_open = true;
-                    self.feedback(Tone::Confirm);
-                }
-                _ => {
-                    self.options_open = false;
-                    self.feedback(Tone::Back);
-                }
-            },
+            }
             InputAction::Back | InputAction::Context => {
                 self.options_open = false;
                 self.feedback(Tone::Back);
@@ -284,11 +355,107 @@ impl XmbApp {
         }
     }
 
+    fn set_background(&mut self, path: PathBuf) {
+        self.settings.background_image = Some(path);
+        self.background_override = None;
+        self.refresh_settings_items();
+        let _ = self.settings.save(self.migrated);
+        self.migrated = false;
+        self.toast("Background updated");
+        self.feedback(Tone::Confirm);
+    }
+
     fn navigate_mode(&mut self, delta: isize) {
         self.state.switch_mode(delta);
         self.options_open = false;
         self.pending_destructive = None;
+        self.submenu = None;
         self.feedback(Tone::Navigate);
+    }
+
+    fn handle_submenu_action(&mut self, action: InputAction) {
+        match action {
+            InputAction::PreviousItem | InputAction::NextItem => {
+                let Some(submenu) = &mut self.submenu else {
+                    return;
+                };
+                let len = submenu.items.len();
+                if len > 0 {
+                    let delta: isize = if matches!(action, InputAction::PreviousItem) {
+                        -1
+                    } else {
+                        1
+                    };
+                    submenu.selection =
+                        (submenu.selection as isize + delta).rem_euclid(len as isize) as usize;
+                }
+                self.feedback(Tone::Navigate);
+            }
+            InputAction::PreviousMode => self.navigate_mode(-1),
+            InputAction::NextMode => self.navigate_mode(1),
+            InputAction::Back | InputAction::Settings => {
+                self.submenu = None;
+                self.feedback(Tone::Back);
+            }
+            InputAction::Confirm => self.confirm_submenu_item(),
+            InputAction::Context | InputAction::Favorite => {}
+        }
+    }
+
+    fn open_submenu(&mut self, group: SettingsGroup) {
+        let items = sources::settings_group_items(group, &self.settings);
+        self.submenu = Some(SubMenu {
+            group,
+            items,
+            selection: 0,
+            position: 0.0,
+        });
+        self.feedback(Tone::Confirm);
+    }
+
+    fn confirm_submenu_item(&mut self) {
+        let Some(item) = self
+            .submenu
+            .as_ref()
+            .and_then(|submenu| submenu.items.get(submenu.selection))
+            .cloned()
+        else {
+            return;
+        };
+        if !item.available {
+            self.toast(
+                item.unavailable_reason
+                    .unwrap_or_else(|| "This item is unavailable".to_owned()),
+            );
+            self.feedback(Tone::Warning);
+            return;
+        }
+        match &item.action {
+            Action::Setting(setting) => {
+                let setting = *setting;
+                let had_background = self.settings.background_image.is_some();
+                adjust_setting(setting, &mut self.settings);
+                self.controller
+                    .set_bindings(self.settings.controller.clone());
+                self.refresh_settings_items();
+                if setting == SettingAction::Background {
+                    self.background_override = None;
+                    self.toast(if had_background {
+                        "Background cleared — monthly gradient restored"
+                    } else {
+                        "Pick one under Photo: △ Options → Set as background"
+                    });
+                } else {
+                    self.toast("Setting updated");
+                }
+                self.feedback(Tone::Confirm);
+            }
+            Action::System(system) if system.destructive() => {
+                self.pending_destructive = Some(item.action);
+                self.feedback(Tone::Warning);
+            }
+            _ => self.execute_in_place(&item.action),
+        }
     }
 
     fn navigate_item(&mut self, delta: isize) {
@@ -308,6 +475,10 @@ impl XmbApp {
                     .unwrap_or_else(|| "This item is unavailable".to_owned()),
             );
             self.feedback(Tone::Warning);
+            return;
+        }
+        if let Action::Group(group) = item.action {
+            self.open_submenu(group);
             return;
         }
         if let Action::Setting(action) = item.action {
@@ -379,17 +550,15 @@ impl XmbApp {
     }
 
     fn refresh_settings_items(&mut self) {
-        let mut items = sources::setting_items(&self.settings);
-        items.extend(sources::system_items());
+        let items = sources::setting_root_items();
+        let len = items.len();
         self.state.items.insert(Mode::Settings, items);
-        let len = self
-            .state
-            .items
-            .get(&Mode::Settings)
-            .map(Vec::len)
-            .unwrap_or(0);
         let selection = self.state.selections.entry(Mode::Settings).or_default();
         *selection = (*selection).min(len.saturating_sub(1));
+        if let Some(submenu) = &mut self.submenu {
+            submenu.items = sources::settings_group_items(submenu.group, &self.settings);
+            submenu.selection = submenu.selection.min(submenu.items.len().saturating_sub(1));
+        }
     }
 
     fn toggle_favorite(&mut self) {
@@ -429,7 +598,7 @@ impl XmbApp {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect().shrink(1.0);
         let painter = ui.painter_at(rect);
-        paint_background(&painter, rect, self.wave_time, &self.settings);
+        self.paint_backdrop(ui.ctx(), &painter, rect);
         self.draw_status(&painter, rect);
         self.draw_categories(ui, &painter, rect);
         self.draw_items(ui, &painter, rect);
@@ -451,6 +620,38 @@ impl XmbApp {
         {
             draw_boot(&painter, rect, veil, wordmark, self.settings.accent);
         }
+    }
+
+    fn paint_backdrop(&mut self, ctx: &egui::Context, painter: &egui::Painter, rect: Rect) {
+        let background = self
+            .background_override
+            .clone()
+            .or_else(|| self.settings.background_image.clone());
+        let mut image_drawn = false;
+        if let Some(path) = background
+            && let Some(texture) = self.texture_for(ctx, &path, TextureTier::Full)
+        {
+            let texture_id = texture.id();
+            let source = texture.size_vec2();
+            let inset = rect.shrink(1.0);
+            let alpha = if self.settings.transparent { 244 } else { 255 };
+            painter.add(
+                egui::epaint::RectShape::filled(
+                    inset,
+                    egui::CornerRadius::same(26),
+                    Color32::from_white_alpha(alpha),
+                )
+                .with_texture(texture_id, cover_uv(source, inset.size())),
+            );
+            // Legibility scrim so white text and waves keep contrast on any picture.
+            painter.add(egui::epaint::RectShape::filled(
+                inset,
+                egui::CornerRadius::same(26),
+                Color32::from_black_alpha(88),
+            ));
+            image_drawn = true;
+        }
+        paint_background(painter, rect, self.wave_time, &self.settings, image_drawn);
     }
 
     fn draw_status(&self, painter: &egui::Painter, rect: Rect) {
@@ -523,11 +724,19 @@ impl XmbApp {
                 Color32::from_white_alpha(alpha),
             );
             if mode == self.state.mode {
+                let label = match &self.submenu {
+                    Some(submenu) => format!(
+                        "{} · {}",
+                        mode.title(),
+                        submenu.group.title().to_ascii_uppercase()
+                    ),
+                    None => mode.title().to_owned(),
+                };
                 shadow_text(
                     painter,
                     Pos2::new(x, center.y + 43.0),
                     Align2::CENTER_TOP,
-                    mode.title(),
+                    &label,
                     FontId::proportional(15.0),
                     Color32::WHITE,
                 );
@@ -537,13 +746,20 @@ impl XmbApp {
 
     fn draw_items(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
         let mode = self.state.mode;
-        let selected = self.state.selected_index();
-        let visual = self
-            .item_positions
-            .get(&mode)
-            .copied()
-            .unwrap_or(selected as f32);
-        let items = self.state.mode_items().to_vec();
+        let in_submenu = self.submenu.is_some();
+        let (items, selected, visual) = if let Some(submenu) = &self.submenu {
+            (submenu.items.clone(), submenu.selection, submenu.position)
+        } else {
+            let selected = self.state.selected_index();
+            (
+                self.state.mode_items().to_vec(),
+                selected,
+                self.item_positions
+                    .get(&mode)
+                    .copied()
+                    .unwrap_or(selected as f32),
+            )
+        };
         if items.is_empty() {
             shadow_text(
                 painter,
@@ -561,21 +777,8 @@ impl XmbApp {
         );
         let row_height = (rect.height() * 0.095).clamp(48.0, 70.0);
 
-        let selected_art = items.get(selected).and_then(|item| self.art_for(item));
-        if let Some(path) = selected_art
-            && let Some(texture) = self.texture_for(ui.ctx(), &path)
-        {
-            let art_size = Vec2::new(rect.width() * 0.34, rect.height() * 0.42);
-            let art_rect = Rect::from_center_size(
-                Pos2::new(rect.right() - art_size.x * 0.55, rect.center().y + 70.0),
-                art_size,
-            );
-            painter.image(
-                texture.id(),
-                art_rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::from_white_alpha(105),
-            );
+        if !in_submenu {
+            self.draw_hero_preview(ui.ctx(), painter, rect, items.get(selected));
         }
 
         // Items above the selection jump over the category crossbar, like the
@@ -600,28 +803,36 @@ impl XmbApp {
             if ui
                 .interact(
                     item_rect,
-                    ui.id().with(("item", mode.index(), index)),
+                    ui.id()
+                        .with(("item", mode.index(), in_submenu, index)),
                     Sense::click(),
                 )
                 .clicked()
             {
-                self.state.selections.insert(mode, index);
+                if let Some(submenu) = &mut self.submenu {
+                    submenu.selection = index;
+                } else {
+                    self.state.selections.insert(mode, index);
+                }
             }
             let icon_path = item
                 .art
                 .clone()
                 .or_else(|| self.generated_art.get(&item.id).and_then(Clone::clone));
-            let texture_id = icon_path
+            let icon = icon_path
                 .as_deref()
-                .and_then(|path| self.texture_for(ui.ctx(), path))
-                .map(TextureHandle::id);
-            if let Some(texture_id) = texture_id {
+                .and_then(|path| self.texture_for(ui.ctx(), path, TextureTier::Thumb))
+                .map(|texture| (texture.id(), texture.size_vec2()));
+            if let Some((texture_id, source)) = icon {
                 let side = if active { 47.0 } else { 31.0 };
-                painter.image(
-                    texture_id,
-                    Rect::from_center_size(Pos2::new(anchor.x, y), Vec2::splat(side)),
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::from_white_alpha(opacity),
+                let display = fit_size(source, Vec2::splat(side), 3.0);
+                painter.add(
+                    egui::epaint::RectShape::filled(
+                        Rect::from_center_size(Pos2::new(anchor.x, y), display),
+                        egui::CornerRadius::same(3),
+                        Color32::from_white_alpha(opacity),
+                    )
+                    .with_texture(texture_id, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))),
                 );
             } else {
                 let color = if item.available {
@@ -658,18 +869,94 @@ impl XmbApp {
         }
     }
 
-    fn texture_for(&mut self, ctx: &egui::Context, path: &Path) -> Option<&TextureHandle> {
-        if !self.textures.contains_key(path) {
+    /// A soft-shadowed, rounded, aspect-correct preview of the selected
+    /// item's artwork on the right side. Small sources (resolved theme icons)
+    /// are skipped rather than blown up into pixel mush.
+    fn draw_hero_preview(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: Rect,
+        item: Option<&LibraryItem>,
+    ) {
+        let Some(item) = item else {
+            return;
+        };
+        let Some(path) = self.art_for(item) else {
+            return;
+        };
+        let Some(texture) = self.texture_for(ctx, &path, TextureTier::Full) else {
+            return;
+        };
+        let source = texture.size_vec2();
+        let texture_id = texture.id();
+        if source.max_elem() < 280.0 {
+            return;
+        }
+        // Bottom-right corner, clear of the selected item's title row at any
+        // window shape.
+        let bounds = Vec2::new(rect.width() * 0.26, rect.height() * 0.38);
+        let display = fit_size(source, bounds, 1.2);
+        let center = Pos2::new(
+            rect.right() - rect.width() * 0.05 - display.x * 0.5,
+            rect.bottom() - rect.height() * 0.09 - display.y * 0.5,
+        );
+        let frame = Rect::from_center_size(center, display);
+        let mut shadow = egui::epaint::RectShape::filled(
+            frame.expand(4.0),
+            egui::CornerRadius::same(14),
+            Color32::from_black_alpha(120),
+        );
+        shadow.blur_width = 30.0;
+        painter.add(shadow);
+        painter.add(
+            egui::epaint::RectShape::new(
+                frame,
+                egui::CornerRadius::same(10),
+                Color32::from_white_alpha(248),
+                Stroke::new(1.0, Color32::from_white_alpha(70)),
+                egui::StrokeKind::Inside,
+            )
+            .with_texture(texture_id, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))),
+        );
+    }
+
+    fn texture_for(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        tier: TextureTier,
+    ) -> Option<&TextureHandle> {
+        let key = (path.to_path_buf(), tier);
+        if !self.textures.contains_key(&key) {
             let image = load_visual(path)?;
-            let image = image.thumbnail(1200, 800).to_rgba8();
+            // No mipmaps on the wgpu backend, so list icons get their own
+            // small high-quality downscale instead of GPU-minified originals.
+            let image = match tier {
+                TextureTier::Thumb if image.width().max(image.height()) > 96 => {
+                    image.resize(96, 96, image::imageops::FilterType::Lanczos3)
+                }
+                TextureTier::Full if image.width().max(image.height()) > 1600 => {
+                    image.resize(1600, 1600, image::imageops::FilterType::CatmullRom)
+                }
+                _ => image,
+            };
+            let image = image.to_rgba8();
             let size = [image.width() as usize, image.height() as usize];
             let pixels = image.into_raw();
             let color = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-            let texture =
-                ctx.load_texture(path.display().to_string(), color, TextureOptions::LINEAR);
-            self.textures.insert(path.to_path_buf(), texture);
+            let suffix = match tier {
+                TextureTier::Thumb => "thumb",
+                TextureTier::Full => "full",
+            };
+            let texture = ctx.load_texture(
+                format!("{}#{suffix}", path.display()),
+                color,
+                TextureOptions::LINEAR,
+            );
+            self.textures.insert(key.clone(), texture);
         }
-        self.textures.get(path)
+        self.textures.get(&key)
     }
 
     fn art_for(&mut self, item: &LibraryItem) -> Option<PathBuf> {
@@ -696,7 +983,7 @@ impl XmbApp {
     }
 
     fn draw_footer(&self, painter: &egui::Painter, rect: Rect) {
-        let text = if self.options_open {
+        let text = if self.options_open || self.submenu.is_some() {
             "× Select     ○ Back"
         } else {
             "× Enter     ○ Back     △ Options"
@@ -712,9 +999,10 @@ impl XmbApp {
     }
 
     fn draw_options(&self, painter: &egui::Painter, rect: Rect) {
+        let entries = self.option_entries();
         let panel = Rect::from_min_size(
-            Pos2::new(rect.right() - 280.0, rect.top() + rect.height() * 0.34),
-            Vec2::new(240.0, 190.0),
+            Pos2::new(rect.right() - 300.0, rect.top() + rect.height() * 0.34),
+            Vec2::new(260.0, 66.0 + entries.len() as f32 * 42.0),
         );
         painter.rect_filled(panel, 4.0, Color32::from_black_alpha(205));
         painter.rect_stroke(
@@ -723,29 +1011,25 @@ impl XmbApp {
             Stroke::new(1.0, Color32::from_white_alpha(100)),
             egui::StrokeKind::Inside,
         );
-        let item = self.state.selected_item();
-        let favorite = item.is_some_and(|item| self.persisted.favorites.contains(&item.id));
-        let lines = [
+        shadow_text(
+            painter,
+            Pos2::new(panel.left() + 24.0, panel.top() + 28.0),
+            Align2::LEFT_CENTER,
             "OPTIONS",
-            if favorite {
-                "Remove Favorite"
-            } else {
-                "Add Favorite"
-            },
-            "Information",
-            "Close",
-        ];
-        for (index, line) in lines.into_iter().enumerate() {
+            FontId::proportional(13.0),
+            Color32::from_white_alpha(170),
+        );
+        for (index, (label, _)) in entries.iter().enumerate() {
             shadow_text(
                 painter,
                 Pos2::new(
                     panel.left() + 24.0,
-                    panel.top() + 28.0 + index as f32 * 42.0,
+                    panel.top() + 70.0 + index as f32 * 42.0,
                 ),
                 Align2::LEFT_CENTER,
-                line,
-                FontId::proportional(if index == 0 { 13.0 } else { 17.0 }),
-                if index > 0 && index - 1 == self.options_selection {
+                label,
+                FontId::proportional(17.0),
+                if index == self.options_selection {
                     Color32::WHITE
                 } else {
                     Color32::from_white_alpha(170)
@@ -994,21 +1278,29 @@ fn video_thumbnail(path: &Path) -> Option<PathBuf> {
     status.success().then_some(output)
 }
 
-fn paint_background(painter: &egui::Painter, rect: Rect, time: f32, settings: &Settings) {
-    let [top, bottom] = monthly_palette(
-        Local::now().month0() as usize,
-        settings.theme,
-        settings.transparent,
-    );
-    let mut mesh = Mesh::default();
+fn paint_background(
+    painter: &egui::Painter,
+    rect: Rect,
+    time: f32,
+    settings: &Settings,
+    image_drawn: bool,
+) {
     let inset = rect.shrink(1.0);
-    mesh.colored_vertex(inset.left_top(), top);
-    mesh.colored_vertex(inset.right_top(), top);
-    mesh.colored_vertex(inset.right_bottom(), bottom);
-    mesh.colored_vertex(inset.left_bottom(), bottom);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    painter.add(Shape::mesh(mesh));
+    if !image_drawn {
+        let [top, bottom] = monthly_palette(
+            Local::now().month0() as usize,
+            settings.theme,
+            settings.transparent,
+        );
+        let mut mesh = Mesh::default();
+        mesh.colored_vertex(inset.left_top(), top);
+        mesh.colored_vertex(inset.right_top(), top);
+        mesh.colored_vertex(inset.right_bottom(), bottom);
+        mesh.colored_vertex(inset.left_bottom(), bottom);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(Shape::mesh(mesh));
+    }
     painter.rect_stroke(
         inset,
         26.0,
@@ -1370,6 +1662,7 @@ fn adjust_setting(action: SettingAction, settings: &mut Settings) {
         SettingAction::Sound => settings.sound = !settings.sound,
         SettingAction::ReducedMotion => settings.reduced_motion = !settings.reduced_motion,
         SettingAction::NetworkArtwork => settings.network_artwork = !settings.network_artwork,
+        SettingAction::Background => settings.background_image = None,
         SettingAction::ResetAppearance => {
             let defaults = Settings::default();
             settings.theme = defaults.theme;
@@ -1377,6 +1670,7 @@ fn adjust_setting(action: SettingAction, settings: &mut Settings) {
             settings.transparent = defaults.transparent;
             settings.waves = defaults.waves;
             settings.reduced_motion = defaults.reduced_motion;
+            settings.background_image = None;
         }
         SettingAction::Binding(target) => settings.controller.cycle(target),
     }
@@ -1456,6 +1750,41 @@ fn ease(current: f32, target: f32, dt: f32, speed: f32) -> f32 {
     current + (target - current) * (1.0 - (-speed * dt).exp())
 }
 
+/// Scale `source` to fit inside `bounds`, preserving aspect ratio and never
+/// upscaling beyond `max_upscale` of the source resolution.
+fn fit_size(source: Vec2, bounds: Vec2, max_upscale: f32) -> Vec2 {
+    if source.x <= 0.0 || source.y <= 0.0 {
+        return bounds;
+    }
+    let scale = (bounds.x / source.x)
+        .min(bounds.y / source.y)
+        .min(max_upscale);
+    source * scale
+}
+
+/// UV rectangle that crops `source` centrally to the aspect ratio of
+/// `target`, for aspect-fill drawing without distortion.
+fn cover_uv(source: Vec2, target: Vec2) -> Rect {
+    if source.x <= 0.0 || source.y <= 0.0 || target.x <= 0.0 || target.y <= 0.0 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let source_aspect = source.x / source.y;
+    let target_aspect = target.x / target.y;
+    if source_aspect > target_aspect {
+        let used = target_aspect / source_aspect;
+        Rect::from_min_max(
+            Pos2::new((1.0 - used) / 2.0, 0.0),
+            Pos2::new((1.0 + used) / 2.0, 1.0),
+        )
+    } else {
+        let used = source_aspect / target_aspect;
+        Rect::from_min_max(
+            Pos2::new(0.0, (1.0 - used) / 2.0),
+            Pos2::new(1.0, (1.0 + used) / 2.0),
+        )
+    }
+}
+
 fn truncate(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         return value.to_owned();
@@ -1496,6 +1825,29 @@ mod tests {
         for (index, color) in colors.iter().enumerate() {
             assert!(!colors[..index].contains(color));
         }
+    }
+
+    #[test]
+    fn fit_preserves_aspect_and_never_overupscales() {
+        // 2:3 cover into a square box keeps the ratio
+        let display = fit_size(Vec2::new(600.0, 900.0), Vec2::splat(47.0), 3.0);
+        assert!((display.x / display.y - 600.0 / 900.0).abs() < 1e-4);
+        assert!(display.y <= 47.0);
+        // a tiny 12px icon may only grow 3x, not fill the box
+        let display = fit_size(Vec2::new(12.0, 12.0), Vec2::splat(47.0), 3.0);
+        assert_eq!(display, Vec2::splat(36.0));
+    }
+
+    #[test]
+    fn cover_uv_crops_the_long_axis_centrally() {
+        // wide source on a square target: x is cropped, y full
+        let uv = cover_uv(Vec2::new(200.0, 100.0), Vec2::new(100.0, 100.0));
+        assert!((uv.min.x - 0.25).abs() < 1e-4 && (uv.max.x - 0.75).abs() < 1e-4);
+        assert_eq!(uv.min.y, 0.0);
+        assert_eq!(uv.max.y, 1.0);
+        // tall source on a square target: y is cropped
+        let uv = cover_uv(Vec2::new(100.0, 200.0), Vec2::new(100.0, 100.0));
+        assert!((uv.min.y - 0.25).abs() < 1e-4 && (uv.max.y - 0.75).abs() < 1e-4);
     }
 
     #[test]

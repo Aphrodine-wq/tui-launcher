@@ -6,7 +6,7 @@ The category order follows the PSP home menu:
 
 **Settings → Extras → Photo → Music → Video → Game → Network**
 
-- **Settings** combines launcher appearance, controller mappings, audio/display shortcuts, power profiles, session actions, and guarded power controls.
+- **Settings** is grouped into Appearance, Controller, System, and Power sub-lists; confirming a group opens it in place and Back returns to the groups.
 - **Extras** discovers visible freedesktop desktop applications and resolves their native icons.
 - **Photo**, **Music**, and **Video** read the configured media folders. Video thumbnails are generated asynchronously.
 - **Game** discovers installed Steam libraries and uses local Steam artwork when available.
@@ -17,6 +17,10 @@ The category order follows the PSP home menu:
 The native overlay opens as a centered, borderless 16:9 window. Categories move horizontally while the selected category remains at the visual anchor; its content forms the vertical part of the XMB, and items above the selection jump over the category crossbar the way the original interface does. Category icons are original vector drawings rendered at any size. Selection motion and the background are time-based and independent of frame rate.
 
 The background is a monthly gradient crossed by filled, glowing wave ribbons with drifting sparkles. The wave accent setting tints the ribbons, sparkles, and boot wordmark (Classic, Aqua, Amber, Rose, Emerald). The transparent-overlay setting switches between a translucent and a fully opaque background. Reduced-motion mode freezes the waves, disables animated transitions, and skips the short boot-in animation.
+
+Any photo can become the background: select it under **Photo**, open Options, and choose "Set as Background". The picture is drawn aspect-filled behind a legibility scrim with the waves on top, and Appearance → Background picture clears it back to the monthly gradient. `--background PATH` previews a picture for one run without saving it.
+
+Artwork is never stretched: item icons and the selected item's corner preview keep their source aspect ratio, icons are downscaled on the CPU for crispness at list size, and low-resolution art is not blown up.
 
 When "Fetch missing Steam artwork" is enabled, boxart for installed Steam games that have no local artwork is downloaded once from Steam's public CDN and cached under `${XDG_CACHE_HOME:-~/.cache}/tui-launcher/steam-art/`. This is the only network access in the application and it stays off by default.
 

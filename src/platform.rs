@@ -22,7 +22,7 @@ pub fn execute(action: &Action) -> Result<String> {
         Action::Media(control) => control_media(control),
         Action::Network(action) => network_action(action),
         Action::System(action) => system_action(action),
-        Action::Setting(_) => Ok(String::new()),
+        Action::Setting(_) | Action::Group(_) => Ok(String::new()),
     }
 }
 

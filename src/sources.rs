@@ -22,9 +22,7 @@ pub fn discover_all(
     persisted: &PersistentState,
 ) -> HashMap<Mode, Vec<LibraryItem>> {
     let mut modes = HashMap::new();
-    let mut settings_items = setting_items(settings);
-    settings_items.extend(system_items());
-    modes.insert(Mode::Settings, settings_items);
+    modes.insert(Mode::Settings, setting_root_items());
     modes.insert(Mode::Extras, discover_applications());
     modes.insert(
         Mode::Photo,
@@ -41,9 +39,41 @@ pub fn discover_all(
     modes.insert(Mode::Game, discover_games());
     modes.insert(Mode::Network, network_items());
     for (mode, items) in &mut modes {
-        order_library(items, persisted, *mode);
+        // Settings keeps its curated order; favorites and recents would
+        // scramble it every time a volume button is used.
+        if *mode != Mode::Settings {
+            order_library(items, persisted, *mode);
+        }
     }
     modes
+}
+
+pub fn setting_root_items() -> Vec<LibraryItem> {
+    crate::model::SettingsGroup::ALL
+        .into_iter()
+        .map(|group| {
+            let mut item = LibraryItem::simple(
+                format!("group:{}", group.title().to_ascii_lowercase()),
+                group.title(),
+                Action::Group(group),
+            );
+            item.subtitle = group.subtitle().to_owned();
+            item
+        })
+        .collect()
+}
+
+pub fn settings_group_items(
+    group: crate::model::SettingsGroup,
+    settings: &Settings,
+) -> Vec<LibraryItem> {
+    use crate::model::SettingsGroup;
+    match group {
+        SettingsGroup::Appearance => setting_items(settings),
+        SettingsGroup::Controller => controller_items(settings),
+        SettingsGroup::System => system_control_items(),
+        SettingsGroup::Power => power_items(),
+    }
 }
 
 pub fn discover_applications() -> Vec<LibraryItem> {
@@ -388,7 +418,7 @@ fn volume_status() -> Option<String> {
     None
 }
 
-pub fn system_items() -> Vec<LibraryItem> {
+pub fn system_control_items() -> Vec<LibraryItem> {
     let mut items = Vec::new();
     add_control(
         &mut items,
@@ -455,6 +485,11 @@ pub fn system_items() -> Vec<LibraryItem> {
         profiles,
         "powerprofilesctl is unavailable",
     );
+    items
+}
+
+pub fn power_items() -> Vec<LibraryItem> {
+    let mut items = Vec::new();
     add_control(
         &mut items,
         "lock",
@@ -519,6 +554,17 @@ pub fn setting_items(settings: &Settings) -> Vec<LibraryItem> {
             SettingAction::Accent,
         ),
         (
+            "background",
+            "Background picture",
+            settings
+                .background_image
+                .as_deref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Monthly gradient".to_owned()),
+            SettingAction::Background,
+        ),
+        (
             "transparent",
             "Transparent overlay",
             on_off(settings.transparent),
@@ -555,7 +601,7 @@ pub fn setting_items(settings: &Settings) -> Vec<LibraryItem> {
             SettingAction::ResetAppearance,
         ),
     ];
-    let mut items = definitions
+    definitions
         .into_iter()
         .map(|(id, title, subtitle, action)| {
             let mut item =
@@ -563,20 +609,25 @@ pub fn setting_items(settings: &Settings) -> Vec<LibraryItem> {
             item.subtitle = subtitle;
             item
         })
-        .collect::<Vec<_>>();
-    items.extend(crate::model::BindingTarget::ALL.into_iter().map(|target| {
-        let mut item = LibraryItem::simple(
-            format!(
-                "setting:binding-{}",
-                target.label().to_ascii_lowercase().replace(' ', "-")
-            ),
-            format!("Controller: {}", target.label()),
-            Action::Setting(SettingAction::Binding(target)),
-        );
-        item.subtitle = settings.controller.get(target).to_owned();
-        item
-    }));
-    items
+        .collect()
+}
+
+pub fn controller_items(settings: &Settings) -> Vec<LibraryItem> {
+    crate::model::BindingTarget::ALL
+        .into_iter()
+        .map(|target| {
+            let mut item = LibraryItem::simple(
+                format!(
+                    "setting:binding-{}",
+                    target.label().to_ascii_lowercase().replace(' ', "-")
+                ),
+                target.label(),
+                Action::Setting(SettingAction::Binding(target)),
+            );
+            item.subtitle = settings.controller.get(target).to_owned();
+            item
+        })
+        .collect()
 }
 
 pub fn order_library(items: &mut [LibraryItem], persisted: &PersistentState, mode: Mode) {
@@ -707,6 +758,7 @@ fn steam_tool(title: &str, app_id: u32) -> bool {
         || lower.starts_with("proton ")
         || lower.contains("steamworks common redistributables")
         || lower.contains("pressure-vessel")
+        || lower.contains("dedicated server")
 }
 
 fn first_file(paths: &[PathBuf]) -> Option<PathBuf> {
@@ -845,7 +897,44 @@ mod tests {
     fn filters_steam_runtime_entries() {
         assert!(steam_tool("Steam Linux Runtime 3.0", 1));
         assert!(steam_tool("Steamworks Common Redistributables", 228980));
+        assert!(steam_tool("Unturned Dedicated Server", 1110390));
         assert!(!steam_tool("Skyrim Special Edition", 489830));
+    }
+
+    #[test]
+    fn settings_are_grouped() {
+        use crate::model::SettingsGroup;
+        let settings = Settings::default();
+        let root = setting_root_items();
+        assert_eq!(root.len(), SettingsGroup::ALL.len());
+        assert!(
+            root.iter()
+                .all(|item| matches!(item.action, Action::Group(_)))
+        );
+        let appearance = settings_group_items(SettingsGroup::Appearance, &settings);
+        assert!(appearance.iter().any(|item| item.id == "setting:background"));
+        assert!(
+            settings_group_items(SettingsGroup::Controller, &settings)
+                .iter()
+                .all(|item| item.id.starts_with("setting:binding-"))
+        );
+        let power = settings_group_items(SettingsGroup::Power, &settings);
+        assert!(power.iter().any(|item| item.id == "system:shutdown"));
+        assert!(!power.iter().any(|item| item.id == "system:volume-up"));
+    }
+
+    #[test]
+    fn background_subtitle_names_the_picture() {
+        let settings = Settings {
+            background_image: Some(PathBuf::from("/home/user/Pictures/sunset.jpg")),
+            ..Settings::default()
+        };
+        let items = setting_items(&settings);
+        let background = items
+            .iter()
+            .find(|item| item.id == "setting:background")
+            .unwrap();
+        assert_eq!(background.subtitle, "sunset.jpg");
     }
 
     #[test]

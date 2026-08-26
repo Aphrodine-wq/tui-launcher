@@ -92,6 +92,37 @@ pub enum Action {
     Network(NetworkAction),
     System(SystemAction),
     Setting(SettingAction),
+    Group(SettingsGroup),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SettingsGroup {
+    Appearance,
+    Controller,
+    System,
+    Power,
+}
+
+impl SettingsGroup {
+    pub const ALL: [Self; 4] = [Self::Appearance, Self::Controller, Self::System, Self::Power];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Controller => "Controller",
+            Self::System => "System",
+            Self::Power => "Power",
+        }
+    }
+
+    pub fn subtitle(self) -> &'static str {
+        match self {
+            Self::Appearance => "Background, waves, accent, motion, sound",
+            Self::Controller => "Button mappings",
+            Self::System => "Volume, brightness, power profile",
+            Self::Power => "Lock, session, and power controls",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +134,7 @@ pub enum SettingAction {
     Sound,
     ReducedMotion,
     NetworkArtwork,
+    Background,
     ResetAppearance,
     Binding(BindingTarget),
 }

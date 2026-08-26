@@ -20,6 +20,9 @@ struct Cli {
     fullscreen: bool,
     #[arg(long, value_enum)]
     start: Option<StartMode>,
+    /// Use this picture as the background for this run without saving it.
+    #[arg(long, value_name = "PATH")]
+    background: Option<std::path::PathBuf>,
     /// Print discovered desktop applications without opening the interface.
     #[arg(long)]
     list: bool,
@@ -99,7 +102,12 @@ fn main() -> Result<()> {
         options,
         Box::new(move |creation| {
             Ok(Box::new(gui::XmbApp::new(
-                creation, settings, migrated, persisted, start,
+                creation,
+                settings,
+                migrated,
+                persisted,
+                start,
+                cli.background,
             )))
         }),
     )?;
