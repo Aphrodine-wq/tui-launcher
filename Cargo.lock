@@ -3421,7 +3421,7 @@ dependencies = [
 
 [[package]]
 name = "tui-launcher"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",

@@ -23,7 +23,11 @@ pub fn discover_all(
 ) -> HashMap<Mode, Vec<LibraryItem>> {
     let mut modes = HashMap::new();
     modes.insert(Mode::Settings, setting_root_items());
-    modes.insert(Mode::Extras, discover_applications());
+    // Steam and Steam-classified applications live in Game, not Extras.
+    let (steam_apps, applications): (Vec<_>, Vec<_>) = discover_applications()
+        .into_iter()
+        .partition(|item| item.id.contains("steam") || item.title.to_ascii_lowercase().contains("steam"));
+    modes.insert(Mode::Extras, applications);
     modes.insert(
         Mode::Photo,
         discover_media(&settings.media_paths, MediaKind::Photo),
@@ -36,7 +40,9 @@ pub fn discover_all(
         Mode::Video,
         discover_media(&settings.media_paths, MediaKind::Video),
     );
-    modes.insert(Mode::Game, discover_games());
+    let mut games = steam_apps;
+    games.extend(discover_games());
+    modes.insert(Mode::Game, games);
     modes.insert(Mode::Network, network_items());
     for (mode, items) in &mut modes {
         // Settings keeps its curated order; favorites and recents would
@@ -281,6 +287,24 @@ pub fn discover_media(roots: &[PathBuf], requested: MediaKind) -> Vec<LibraryIte
 }
 
 pub fn network_items() -> Vec<LibraryItem> {
+    // Network configuration lives under Settings → System; the category
+    // keeps the browser, like the original home menu.
+    let mut browser = LibraryItem::simple(
+        "network:browser",
+        "Internet Browser",
+        Action::Network(NetworkAction::OpenBrowser),
+    );
+    browser.subtitle = system_status()
+        .network
+        .map(|status| format!("{status} — open the default browser"))
+        .unwrap_or_else(|| "Open the default browser".to_owned());
+    if !command_exists("xdg-open") {
+        browser = browser.unavailable("xdg-open is unavailable");
+    }
+    vec![browser]
+}
+
+fn network_settings_item() -> LibraryItem {
     let status = system_status()
         .network
         .unwrap_or_else(|| "Offline".to_owned());
@@ -293,16 +317,7 @@ pub fn network_items() -> Vec<LibraryItem> {
     if !command_exists("nm-connection-editor") && !command_exists("gnome-control-center") {
         connection = connection.unavailable("no graphical network settings tool was found");
     }
-    let mut browser = LibraryItem::simple(
-        "network:browser",
-        "Internet Browser",
-        Action::Network(NetworkAction::OpenBrowser),
-    );
-    browser.subtitle = "Open the default browser".to_owned();
-    if !command_exists("xdg-open") {
-        browser = browser.unavailable("xdg-open is unavailable");
-    }
-    vec![connection, browser]
+    connection
 }
 
 pub fn media_control_items(now: Option<&NowPlaying>) -> Vec<LibraryItem> {
@@ -419,7 +434,7 @@ fn volume_status() -> Option<String> {
 }
 
 pub fn system_control_items() -> Vec<LibraryItem> {
-    let mut items = Vec::new();
+    let mut items = vec![network_settings_item()];
     add_control(
         &mut items,
         "volume-down",
@@ -635,12 +650,16 @@ pub fn controller_items(settings: &Settings) -> Vec<LibraryItem> {
 
 pub fn order_library(items: &mut [LibraryItem], persisted: &PersistentState, mode: Mode) {
     items.sort_by(|left, right| {
+        // The Steam client is pinned to the top of Game, above favorites.
+        let left_pinned = left.id == "application:steam";
+        let right_pinned = right.id == "application:steam";
         let left_favorite = persisted.favorites.contains(&left.id);
         let right_favorite = persisted.favorites.contains(&right.id);
         let left_recent = persisted.recent_position(mode, &left.id);
         let right_recent = persisted.recent_position(mode, &right.id);
-        right_favorite
-            .cmp(&left_favorite)
+        right_pinned
+            .cmp(&left_pinned)
+            .then_with(|| right_favorite.cmp(&left_favorite))
             .then_with(|| match (left_recent, right_recent) {
                 (Some(left), Some(right)) => left.cmp(&right),
                 (Some(_), None) => std::cmp::Ordering::Less,
@@ -925,6 +944,32 @@ mod tests {
         assert!(power.iter().any(|item| item.id == "system:shutdown"));
         assert!(!power.iter().any(|item| item.id == "system:volume-up"));
         assert_eq!(power.first().map(|item| item.id.as_str()), Some("system:exit"));
+        let system = settings_group_items(SettingsGroup::System, &settings);
+        assert_eq!(
+            system.first().map(|item| item.id.as_str()),
+            Some("network:connections")
+        );
+    }
+
+    #[test]
+    fn network_category_keeps_only_the_browser() {
+        let items = network_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "network:browser");
+    }
+
+    #[test]
+    fn steam_client_is_pinned_above_favorites() {
+        let mut items = vec![
+            LibraryItem::simple("steam:100", "Alpha Game", Action::Steam(100)),
+            LibraryItem::simple("application:steam", "Steam", Action::Setting(SettingAction::Theme)),
+            LibraryItem::simple("steam:200", "Beta Game", Action::Steam(200)),
+        ];
+        let mut state = PersistentState::default();
+        state.favorites.insert("steam:200".into());
+        order_library(&mut items, &state, Mode::Game);
+        assert_eq!(items[0].id, "application:steam");
+        assert_eq!(items[1].id, "steam:200");
     }
 
     #[test]

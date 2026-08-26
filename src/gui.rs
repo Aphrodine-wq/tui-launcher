@@ -454,6 +454,9 @@ impl XmbApp {
                 self.pending_destructive = Some(item.action);
                 self.feedback(Tone::Warning);
             }
+            _ if item.action.launches_external_window() => {
+                self.launch_external(item.action, ctx);
+            }
             _ => self.execute_in_place(&item.action),
         }
     }
@@ -751,20 +754,17 @@ impl XmbApp {
 
     fn draw_items(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
         let mode = self.state.mode;
-        let in_submenu = self.submenu.is_some();
-        let (items, selected, visual) = if let Some(submenu) = &self.submenu {
-            (submenu.items.clone(), submenu.selection, submenu.position)
-        } else {
-            let selected = self.state.selected_index();
-            (
-                self.state.mode_items().to_vec(),
-                selected,
-                self.item_positions
-                    .get(&mode)
-                    .copied()
-                    .unwrap_or(selected as f32),
-            )
-        };
+        if mode == Mode::Settings {
+            self.draw_settings_menu(ui, painter, rect);
+            return;
+        }
+        let selected = self.state.selected_index();
+        let visual = self
+            .item_positions
+            .get(&mode)
+            .copied()
+            .unwrap_or(selected as f32);
+        let items = self.state.mode_items().to_vec();
         if items.is_empty() {
             shadow_text(
                 painter,
@@ -782,9 +782,7 @@ impl XmbApp {
         );
         let row_height = (rect.height() * 0.095).clamp(48.0, 70.0);
 
-        if !in_submenu {
-            self.draw_hero_preview(ui.ctx(), painter, rect, items.get(selected));
-        }
+        self.draw_hero_preview(ui.ctx(), painter, rect, items.get(selected));
 
         // Items above the selection jump over the category crossbar, like the
         // original XMB; the ramp keeps scrolling continuous.
@@ -808,17 +806,12 @@ impl XmbApp {
             if ui
                 .interact(
                     item_rect,
-                    ui.id()
-                        .with(("item", mode.index(), in_submenu, index)),
+                    ui.id().with(("item", mode.index(), index)),
                     Sense::click(),
                 )
                 .clicked()
             {
-                if let Some(submenu) = &mut self.submenu {
-                    submenu.selection = index;
-                } else {
-                    self.state.selections.insert(mode, index);
-                }
+                self.state.selections.insert(mode, index);
             }
             let icon_path = item
                 .art
@@ -871,6 +864,161 @@ impl XmbApp {
                     );
                 }
             }
+        }
+    }
+
+    /// Settings render as a proper menu panel — a rounded card with
+    /// highlighted rows and right-aligned values — instead of sparse XMB
+    /// items. Covers both the group list and an open group.
+    fn draw_settings_menu(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
+        let (title, items, selection, position, in_submenu) = match &self.submenu {
+            Some(submenu) => (
+                submenu.group.title().to_owned(),
+                submenu.items.clone(),
+                submenu.selection,
+                submenu.position,
+                true,
+            ),
+            None => {
+                let selection = self.state.selected_index();
+                (
+                    "Settings".to_owned(),
+                    self.state.mode_items().to_vec(),
+                    selection,
+                    self.item_positions
+                        .get(&Mode::Settings)
+                        .copied()
+                        .unwrap_or(selection as f32),
+                    false,
+                )
+            }
+        };
+        if items.is_empty() {
+            return;
+        }
+        let accent = accent_color(self.settings.accent);
+        let spine = rect.center().x - rect.width() * 0.08;
+        let panel_width = (rect.width() * 0.52).clamp(430.0, 660.0);
+        let header = 44.0;
+        let row_height = 44.0;
+        let top = rect.top() + rect.height() * 0.42;
+        let max_bottom = rect.bottom() - rect.height() * 0.11;
+        let content_bottom = top + header + items.len() as f32 * row_height + 12.0;
+        let panel = Rect::from_min_max(
+            Pos2::new(spine - 58.0, top),
+            Pos2::new(
+                (spine - 58.0 + panel_width).min(rect.right() - 30.0),
+                content_bottom.min(max_bottom),
+            ),
+        );
+        painter.rect_filled(panel, 12.0, Color32::from_black_alpha(158));
+        painter.rect_stroke(
+            panel,
+            12.0,
+            Stroke::new(1.0, Color32::from_white_alpha(58)),
+            egui::StrokeKind::Inside,
+        );
+        shadow_text(
+            painter,
+            Pos2::new(panel.left() + 22.0, panel.top() + 25.0),
+            Align2::LEFT_CENTER,
+            &title.to_uppercase(),
+            FontId::proportional(12.0),
+            Color32::from_white_alpha(150),
+        );
+        let list = Rect::from_min_max(
+            Pos2::new(panel.left(), panel.top() + header),
+            Pos2::new(panel.right(), panel.bottom() - 8.0),
+        );
+        let clipped = painter.with_clip_rect(list);
+        let visible = (list.height() / row_height).floor().max(1.0);
+        let max_scroll = ((items.len() as f32 - visible) * row_height).max(0.0);
+        let scroll = (((position + 0.5) - visible / 2.0) * row_height).clamp(0.0, max_scroll);
+        for (index, item) in items.iter().enumerate() {
+            let y = list.top() + index as f32 * row_height - scroll;
+            if y + row_height < list.top() || y > list.bottom() {
+                continue;
+            }
+            let row = Rect::from_min_size(
+                Pos2::new(panel.left() + 10.0, y + 3.0),
+                Vec2::new(panel.width() - 20.0, row_height - 6.0),
+            );
+            if ui
+                .interact(
+                    row,
+                    ui.id().with(("settings-row", in_submenu, index)),
+                    Sense::click(),
+                )
+                .clicked()
+            {
+                if let Some(submenu) = &mut self.submenu {
+                    submenu.selection = index;
+                } else {
+                    self.state.selections.insert(Mode::Settings, index);
+                }
+            }
+            let active = index == selection;
+            if active {
+                clipped.rect_filled(row, 8.0, tint(accent, 30));
+                clipped.rect_stroke(
+                    row,
+                    8.0,
+                    Stroke::new(1.0, tint(accent, 120)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            let title_color = if !item.available {
+                Color32::from_gray(120)
+            } else if active {
+                Color32::WHITE
+            } else {
+                Color32::from_white_alpha(185)
+            };
+            shadow_text(
+                &clipped,
+                Pos2::new(row.left() + 14.0, row.center().y),
+                Align2::LEFT_CENTER,
+                &truncate(&item.title, 34),
+                FontId::proportional(15.0),
+                title_color,
+            );
+            let value = if in_submenu {
+                truncate(&item.subtitle, 30)
+            } else {
+                "›".to_owned()
+            };
+            shadow_text(
+                &clipped,
+                Pos2::new(row.right() - 14.0, row.center().y),
+                Align2::RIGHT_CENTER,
+                &value,
+                FontId::proportional(if in_submenu { 12.0 } else { 17.0 }),
+                if item.available {
+                    Color32::from_white_alpha(150)
+                } else {
+                    Color32::from_gray(110)
+                },
+            );
+        }
+        if scroll > 1.0 {
+            shadow_text(
+                painter,
+                Pos2::new(panel.right() - 20.0, panel.top() + 25.0),
+                Align2::CENTER_CENTER,
+                "▲",
+                FontId::proportional(10.0),
+                Color32::from_white_alpha(140),
+            );
+        }
+        if scroll < max_scroll - 1.0 {
+            shadow_text(
+                painter,
+                Pos2::new(panel.right() - 20.0, panel.bottom() - 16.0),
+                Align2::CENTER_CENTER,
+                "▼",
+                FontId::proportional(10.0),
+                Color32::from_white_alpha(140),
+            );
         }
     }
 
@@ -1009,10 +1157,10 @@ impl XmbApp {
             Pos2::new(rect.right() - 300.0, rect.top() + rect.height() * 0.34),
             Vec2::new(260.0, 66.0 + entries.len() as f32 * 42.0),
         );
-        painter.rect_filled(panel, 4.0, Color32::from_black_alpha(205));
+        painter.rect_filled(panel, 12.0, Color32::from_black_alpha(205));
         painter.rect_stroke(
             panel,
-            4.0,
+            12.0,
             Stroke::new(1.0, Color32::from_white_alpha(100)),
             egui::StrokeKind::Inside,
         );
@@ -1048,10 +1196,10 @@ impl XmbApp {
             return;
         };
         let panel = Rect::from_center_size(rect.center(), Vec2::new(640.0, 340.0));
-        painter.rect_filled(panel, 8.0, Color32::from_black_alpha(225));
+        painter.rect_filled(panel, 12.0, Color32::from_black_alpha(225));
         painter.rect_stroke(
             panel,
-            8.0,
+            12.0,
             Stroke::new(1.0, Color32::from_white_alpha(110)),
             egui::StrokeKind::Inside,
         );
@@ -1096,10 +1244,10 @@ impl XmbApp {
 
     fn draw_confirmation(&self, painter: &egui::Painter, rect: Rect, _action: &Action) {
         let panel = Rect::from_center_size(rect.center(), Vec2::new(430.0, 170.0));
-        painter.rect_filled(panel, 8.0, Color32::from_black_alpha(225));
+        painter.rect_filled(panel, 12.0, Color32::from_black_alpha(225));
         painter.rect_stroke(
             panel,
-            8.0,
+            12.0,
             Stroke::new(1.0, Color32::from_white_alpha(120)),
             egui::StrokeKind::Inside,
         );

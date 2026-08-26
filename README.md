@@ -6,11 +6,11 @@ The category order follows the PSP home menu:
 
 **Settings → Extras → Photo → Music → Video → Game → Network**
 
-- **Settings** is grouped into Appearance, Controller, System, and Power sub-lists; confirming a group opens it in place and Back returns to the groups.
-- **Extras** discovers visible freedesktop desktop applications and resolves their native icons.
+- **Settings** renders as a menu panel with Appearance, Controller, System, and Power groups; confirming a group opens it in place and Back returns. Network configuration lives under System.
+- **Extras** discovers visible freedesktop desktop applications and resolves their native icons. Steam-classified entries are shown under Game instead.
 - **Photo**, **Music**, and **Video** read the configured media folders. Video thumbnails are generated asynchronously.
-- **Game** discovers installed Steam libraries and uses local Steam artwork when available.
-- **Network** exposes current connection state, graphical network settings, and the default browser.
+- **Game** pins the Steam client first, then installed Steam games with local artwork; runtime tools and dedicated servers are filtered out.
+- **Network** opens the default browser and shows the connection state.
 
 ## Interface
 

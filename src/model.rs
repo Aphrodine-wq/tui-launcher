@@ -120,7 +120,7 @@ impl SettingsGroup {
         match self {
             Self::Appearance => "Background, waves, accent, motion, sound",
             Self::Controller => "Button mappings",
-            Self::System => "Volume, brightness, power profile",
+            Self::System => "Network, volume, brightness, power profile",
             Self::Power => "Lock, session, and power controls",
         }
     }
