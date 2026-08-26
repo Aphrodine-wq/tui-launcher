@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    model::{Action, MediaControl, SystemAction},
+    model::{Action, MediaControl, NetworkAction, SystemAction},
     sources::command_exists,
 };
 
@@ -20,8 +20,28 @@ pub fn execute(action: &Action) -> Result<String> {
             spawn_path("xdg-open", path).map(|_| format!("Opening {}", path.display()))
         }
         Action::Media(control) => control_media(control),
+        Action::Network(action) => network_action(action),
         Action::System(action) => system_action(action),
         Action::Setting(_) => Ok(String::new()),
+    }
+}
+
+fn network_action(action: &NetworkAction) -> Result<String> {
+    match action {
+        NetworkAction::OpenBrowser => {
+            spawn("xdg-open", &["https://www.google.com"])?;
+            Ok("Opening the default browser".to_owned())
+        }
+        NetworkAction::OpenConnections => {
+            if command_exists("nm-connection-editor") {
+                spawn("nm-connection-editor", &[])?;
+            } else if command_exists("gnome-control-center") {
+                spawn("gnome-control-center", &["wifi"])?;
+            } else {
+                bail!("no graphical network settings tool was found");
+            }
+            Ok("Opening network settings".to_owned())
+        }
     }
 }
 

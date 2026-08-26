@@ -12,8 +12,8 @@ use freedesktop_desktop_entry::{
 use crate::{
     config::{PersistentState, Settings},
     model::{
-        Action, LibraryItem, MediaControl, Mode, NowPlaying, SettingAction, SystemAction,
-        SystemStatus,
+        Action, LibraryItem, MediaControl, Mode, NetworkAction, NowPlaying, SettingAction,
+        SystemAction, SystemStatus,
     },
 };
 
@@ -22,11 +22,24 @@ pub fn discover_all(
     persisted: &PersistentState,
 ) -> HashMap<Mode, Vec<LibraryItem>> {
     let mut modes = HashMap::new();
-    modes.insert(Mode::Applications, discover_applications());
-    modes.insert(Mode::Games, discover_games());
-    modes.insert(Mode::Media, discover_media(&settings.media_paths));
-    modes.insert(Mode::System, system_items());
-    modes.insert(Mode::Settings, setting_items(settings));
+    let mut settings_items = setting_items(settings);
+    settings_items.extend(system_items());
+    modes.insert(Mode::Settings, settings_items);
+    modes.insert(Mode::Extras, discover_applications());
+    modes.insert(
+        Mode::Photo,
+        discover_media(&settings.media_paths, MediaKind::Photo),
+    );
+    modes.insert(
+        Mode::Music,
+        discover_media(&settings.media_paths, MediaKind::Music),
+    );
+    modes.insert(
+        Mode::Video,
+        discover_media(&settings.media_paths, MediaKind::Video),
+    );
+    modes.insert(Mode::Game, discover_games());
+    modes.insert(Mode::Network, network_items());
     for (mode, items) in &mut modes {
         order_library(items, persisted, *mode);
     }
@@ -165,7 +178,14 @@ pub fn discover_games() -> Vec<LibraryItem> {
     games
 }
 
-pub fn discover_media(roots: &[PathBuf]) -> Vec<LibraryItem> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaKind {
+    Photo,
+    Music,
+    Video,
+}
+
+pub fn discover_media(roots: &[PathBuf], requested: MediaKind) -> Vec<LibraryItem> {
     let mut paths = Vec::new();
     for root in roots {
         walk_media(root, 0, &mut paths);
@@ -185,7 +205,7 @@ pub fn discover_media(roots: &[PathBuf]) -> Vec<LibraryItem> {
     });
     paths
         .into_iter()
-        .map(|path| {
+        .filter_map(|path| {
             let title = path
                 .file_stem()
                 .and_then(|name| name.to_str())
@@ -197,26 +217,59 @@ pub fn discover_media(roots: &[PathBuf]) -> Vec<LibraryItem> {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             let kind = if image_extension(&extension) {
-                "Picture"
+                MediaKind::Photo
             } else if audio_extension(&extension) {
-                "Music"
+                MediaKind::Music
             } else {
-                "Video"
+                MediaKind::Video
             };
+            if kind != requested {
+                return None;
+            }
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
             let mut item = LibraryItem::simple(
                 format!("media:{}", canonical.display()),
                 title,
                 Action::Open(path.clone()),
             );
-            item.subtitle = kind.to_owned();
+            item.subtitle = match kind {
+                MediaKind::Photo => "Picture",
+                MediaKind::Music => "Music",
+                MediaKind::Video => "Video",
+            }
+            .to_owned();
             item.details = vec![path.display().to_string()];
-            if kind == "Picture" {
+            if kind == MediaKind::Photo {
                 item.art = Some(path);
             }
-            item
+            Some(item)
         })
         .collect()
+}
+
+pub fn network_items() -> Vec<LibraryItem> {
+    let status = system_status()
+        .network
+        .unwrap_or_else(|| "Offline".to_owned());
+    let mut connection = LibraryItem::simple(
+        "network:connections",
+        "Network Settings",
+        Action::Network(NetworkAction::OpenConnections),
+    );
+    connection.subtitle = status;
+    if !command_exists("nm-connection-editor") && !command_exists("gnome-control-center") {
+        connection = connection.unavailable("no graphical network settings tool was found");
+    }
+    let mut browser = LibraryItem::simple(
+        "network:browser",
+        "Internet Browser",
+        Action::Network(NetworkAction::OpenBrowser),
+    );
+    browser.subtitle = "Open the default browser".to_owned();
+    if !command_exists("xdg-open") {
+        browser = browser.unavailable("xdg-open is unavailable");
+    }
+    vec![connection, browser]
 }
 
 pub fn media_control_items(now: Option<&NowPlaying>) -> Vec<LibraryItem> {
@@ -478,12 +531,6 @@ pub fn setting_items(settings: &Settings) -> Vec<LibraryItem> {
             "Interface sound",
             on_off(settings.sound),
             SettingAction::Sound,
-        ),
-        (
-            "rumble",
-            "Controller rumble",
-            on_off(settings.rumble),
-            SettingAction::Rumble,
         ),
         (
             "reduced-motion",
@@ -771,8 +818,8 @@ mod tests {
         ];
         let mut state = PersistentState::default();
         state.favorites.insert("c".into());
-        state.record_recent(Mode::Applications, "b");
-        order_library(&mut items, &state, Mode::Applications);
+        state.record_recent(Mode::Extras, "b");
+        order_library(&mut items, &state, Mode::Extras);
         assert_eq!(
             items
                 .iter()

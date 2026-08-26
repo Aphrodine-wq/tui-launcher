@@ -1,86 +1,69 @@
 # tui-launcher
 
-An original PSP-inspired XMB console hub for Linux terminals. `tui-launcher` combines desktop
-applications, an installed Steam library, local media, quick system controls, and appearance/input
-settings in one keyboard-, mouse-, and controller-native interface.
+A native PSP-inspired XMB desktop overlay for Linux. The interface is GPU-rendered and controller-first; it is not embedded in a terminal.
 
-The normal command remains a quick floating launcher. Full-screen mode stays alive behind launched
-content and refreshes when focus returns.
+The category order follows the PSP home menu:
 
-## Modes
+**Settings → Extras → Photo → Music → Video → Game → Network**
 
-- **Applications** discovers visible freedesktop `.desktop` entries and launches them with `gio` or
-  `gtk-launch`.
-- **Games** discovers installed Steam libraries and uses local Steam posters, heroes, and metadata.
-- **Media** exposes MPRIS now-playing controls and browses the configured Videos, Pictures, and Music
-  folders. Images render directly; video thumbnails are generated lazily when `ffmpegthumbnailer`
-  is available.
-- **System** provides capability-aware volume, brightness, power-profile, lock, logout, suspend,
-  restart, and power-off actions. Session-ending actions require a one-second hold.
-- **Settings** changes themes, XMB waves, transparency, sound, rumble, reduced motion, optional
-  artwork downloads, panel width, and every controller binding.
+- **Settings** combines launcher appearance, controller mappings, audio/display shortcuts, power profiles, session actions, and guarded power controls.
+- **Extras** discovers visible freedesktop desktop applications and resolves their native icons.
+- **Photo**, **Music**, and **Video** read the configured media folders. Video thumbnails are generated asynchronously.
+- **Game** discovers installed Steam libraries and uses local Steam artwork when available.
+- **Network** exposes current connection state, graphical network settings, and the default browser.
 
-Favorites, the last position in each mode, and the latest 20 launched items persist between runs.
-Artwork and thumbnails load outside the render path, so missing or slow assets do not block input.
+## Interface
+
+The native overlay opens as a centered, borderless 16:9 window. Categories move horizontally while the selected category remains at the visual anchor; its content forms the vertical part of the XMB. Selection motion and the background waves are time-based and independent of frame rate.
+
+The default background color follows the current month. Themes offset that monthly palette, and reduced-motion mode disables animated transitions.
+
+Launching an application, game, photo, video, or network tool hides the overlay. On Hyprland, the launcher watches for the new window and restores the overlay to the same category and item after that window closes.
+
+Controller rumble is not used.
 
 ## Controls
 
-| Keyboard | Controller default | Action |
+| Action | Keyboard | Default controller |
 | --- | --- | --- |
-| Left/right or `h l` | D-pad left/right | Change mode |
-| Up/down or `j k` | D-pad up/down | Browse items |
-| `Enter` | South / Cross / A | Launch or change setting |
-| `C` | North / Triangle / Y | Open or close details |
-| `F` | West / Square / X | Toggle favorite |
-| `S` | Start/Menu | Open Settings |
-| `Escape` or `q` | East / Circle / B | Back or close |
-| Mouse wheel | — | Browse items |
+| Change category | Left / Right | D-pad or left stick |
+| Change item | Up / Down | D-pad or left stick |
+| Confirm | Enter / Space | South button |
+| Back / close | Escape | East button |
+| Options menu | T | North button |
+| Favorite | F | West button |
+| Jump to Settings | S | Start / Menu |
 
-Controller prompts adapt to PlayStation- and Xbox-style devices. Bindings are remappable from the
-Settings mode; assigning an occupied button swaps the two actions. Sound and force feedback fail
-softly when no audio device or rumble-capable controller is present.
+The on-screen prompts intentionally use the PSP-style ×, ○, and △ symbols while input remains mapped to the connected controller.
 
 ## Commands
 
 ```bash
-# Quick floating overlay (default)
+# Native desktop overlay
 tui-launcher
 
-# Persistent console hub
+# Full-monitor presentation
 tui-launcher --fullscreen
 
-# Open directly in a mode
-tui-launcher --fullscreen --start games
+# Open on a specific category
+tui-launcher --start game
 
-# Backward-compatible desktop-entry list
+# Non-graphical inventory and diagnostics
 tui-launcher --list
-
-# Content counts and backend availability
 tui-launcher --diagnose
 ```
 
-`--overlay` explicitly selects the quick profile. `--overlay` and `--fullscreen` are mutually
-exclusive.
-
-## Configuration and state
+## Data
 
 - Configuration: `${XDG_CONFIG_HOME:-~/.config}/tui-launcher/config.toml`
-- Persistent favorites/history: `${XDG_STATE_HOME:-~/.local/state}/tui-launcher/state.toml`
-- Generated/downloaded artwork: `${XDG_CACHE_HOME:-~/.cache}/tui-launcher/`
+- Favorites, recents, and selections: `${XDG_STATE_HOME:-~/.local/state}/tui-launcher/state.toml`
+- Generated video thumbnails: `${XDG_CACHE_HOME:-~/.cache}/tui-launcher/thumbs/`
 
-Version 4 configuration files migrate to version 5 without losing the existing theme, accent,
-transparency, border, icon dimensions, animation speed, or panel width. The original v4 file is
-backed up once as `config.toml.bak-v4` when v5 is first saved. Writes use a same-directory temporary
-file and atomic rename.
-
-Network artwork is off by default. When enabled, only missing Steam posters are downloaded over
-HTTPS, decoded before use, and stored in a cache capped at 256 MiB.
+Version 4 terminal-launcher configuration is migrated to version 5 without discarding appearance preferences. A one-time `config.toml.bak-v4` backup is created when the migrated configuration is saved.
 
 ## Build
 
-Rust 1.85 or newer is recommended. Linux controller/audio support requires the development packages
-for `libudev` and ALSA. Optional runtime integrations include Steam, `ffmpegthumbnailer`, `ffprobe`,
-`xdg-open`, `wpctl`/`pactl`, `brightnessctl`, `powerprofilesctl`, `loginctl`, and Hyprland tools.
+The native interface uses eframe/egui with wgpu and supports both Wayland and X11.
 
 ```bash
 cargo test
@@ -89,11 +72,4 @@ cargo build --release
 ./target/release/tui-launcher --diagnose
 ```
 
-Install only after validating the build interactively:
-
-```bash
-cargo install --path . --locked --force
-```
-
-The interface and synthesized feedback are original. No PSP artwork, sound, or firmware assets are
-included.
+This project uses original code and procedural visuals. It does not bundle Sony firmware, icons, sounds, or other PlayStation assets.

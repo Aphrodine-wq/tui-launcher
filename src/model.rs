@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, time::Instant};
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -6,39 +6,47 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     #[default]
-    Applications,
-    Games,
-    Media,
-    System,
     Settings,
+    Extras,
+    Photo,
+    Music,
+    Video,
+    Game,
+    Network,
 }
 
 impl Mode {
-    pub const ALL: [Self; 5] = [
-        Self::Applications,
-        Self::Games,
-        Self::Media,
-        Self::System,
+    pub const ALL: [Self; 7] = [
         Self::Settings,
+        Self::Extras,
+        Self::Photo,
+        Self::Music,
+        Self::Video,
+        Self::Game,
+        Self::Network,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::Applications => "APPLICATIONS",
-            Self::Games => "GAMES",
-            Self::Media => "MEDIA",
-            Self::System => "SYSTEM",
             Self::Settings => "SETTINGS",
+            Self::Extras => "EXTRAS",
+            Self::Photo => "PHOTO",
+            Self::Music => "MUSIC",
+            Self::Video => "VIDEO",
+            Self::Game => "GAME",
+            Self::Network => "NETWORK",
         }
     }
 
     pub fn glyph(self) -> &'static str {
         match self {
-            Self::Applications => "▦",
-            Self::Games => "◆",
-            Self::Media => "▶",
-            Self::System => "◉",
             Self::Settings => "⚙",
+            Self::Extras => "✦",
+            Self::Photo => "▧",
+            Self::Music => "♪",
+            Self::Video => "▶",
+            Self::Game => "◆",
+            Self::Network => "◎",
         }
     }
 
@@ -52,6 +60,12 @@ pub enum MediaControl {
     Previous,
     PlayPause,
     Next,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NetworkAction {
+    OpenBrowser,
+    OpenConnections,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +99,7 @@ pub enum Action {
     Steam(u32),
     Open(PathBuf),
     Media(MediaControl),
+    Network(NetworkAction),
     System(SystemAction),
     Setting(SettingAction),
 }
@@ -96,7 +111,6 @@ pub enum SettingAction {
     Transparent,
     Waves,
     Sound,
-    Rumble,
     ReducedMotion,
     NetworkArtwork,
     PanelWidth,
@@ -200,12 +214,6 @@ pub struct AppState {
     pub mode: Mode,
     pub items: HashMap<Mode, Vec<LibraryItem>>,
     pub selections: HashMap<Mode, usize>,
-    pub detail_open: bool,
-    pub toast: Option<(String, Instant)>,
-    pub hold_started: Option<(String, Instant)>,
-    pub focused: bool,
-    pub motion: f32,
-    pub last_tick: Instant,
     pub now_playing: Option<NowPlaying>,
     pub system_status: SystemStatus,
     pub controller_name: Option<String>,
@@ -218,12 +226,6 @@ impl AppState {
             mode,
             items,
             selections,
-            detail_open: false,
-            toast: None,
-            hold_started: None,
-            focused: true,
-            motion: 0.0,
-            last_tick: Instant::now(),
             now_playing: None,
             system_status: SystemStatus::default(),
             controller_name: None,
@@ -250,39 +252,10 @@ impl AppState {
         let current = self.selected_index();
         let next = (current as isize + delta).rem_euclid(len as isize) as usize;
         self.selections.insert(self.mode, next);
-        self.motion = (self.motion + delta.signum() as f32).clamp(-3.0, 3.0);
     }
 
     pub fn switch_mode(&mut self, delta: isize) {
         let next = (self.mode.index() as isize + delta).rem_euclid(Mode::ALL.len() as isize);
         self.mode = Mode::ALL[next as usize];
-        self.detail_open = false;
-        self.hold_started = None;
-        self.motion = delta.signum() as f32;
-    }
-
-    pub fn tick(&mut self, reduced_motion: bool) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
-        self.last_tick = now;
-        if reduced_motion {
-            self.motion = 0.0;
-        } else if self.motion.abs() > 0.001 {
-            self.motion *= (-9.0 * elapsed).exp();
-            if self.motion.abs() < 0.01 {
-                self.motion = 0.0;
-            }
-        }
-        if self
-            .toast
-            .as_ref()
-            .is_some_and(|(_, at)| now.duration_since(*at).as_secs() >= 3)
-        {
-            self.toast = None;
-        }
-    }
-
-    pub fn toast(&mut self, message: impl Into<String>) {
-        self.toast = Some((message.into(), Instant::now()));
     }
 }

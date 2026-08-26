@@ -337,10 +337,10 @@ mod tests {
     fn recent_history_is_unique_and_bounded() {
         let mut state = PersistentState::default();
         for id in 0..30 {
-            state.record_recent(Mode::Games, &id.to_string());
+            state.record_recent(Mode::Game, &id.to_string());
         }
-        state.record_recent(Mode::Games, "25");
-        let recents = &state.recents["games"];
+        state.record_recent(Mode::Game, "25");
+        let recents = &state.recents["game"];
         assert_eq!(recents.len(), 20);
         assert_eq!(recents[0], "25");
     }
