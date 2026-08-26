@@ -37,6 +37,11 @@ pub struct Settings {
     pub network_artwork: bool,
     pub default_fullscreen: bool,
     pub background_image: Option<PathBuf>,
+    pub background_mode: String,
+    pub theme_pack: Option<String>,
+    pub sparkles: bool,
+    pub boot_animation: bool,
+    pub clock_24h: bool,
     pub media_paths: Vec<PathBuf>,
     pub controller: ControllerBindings,
 }
@@ -66,6 +71,11 @@ impl Default for Settings {
             network_artwork: false,
             default_fullscreen: false,
             background_image: None,
+            background_mode: "gradient".to_owned(),
+            theme_pack: None,
+            sparkles: true,
+            boot_animation: true,
+            clock_24h: false,
             media_paths: default_media_paths(),
             controller: ControllerBindings::default(),
         }
@@ -190,6 +200,12 @@ impl Settings {
         self.panel_width = self.panel_width.clamp(50, 600);
         self.sound_volume = self.sound_volume.clamp(0.0, 1.0);
         self.rumble_strength = self.rumble_strength.clamp(0.0, 1.0);
+        if !matches!(
+            self.background_mode.as_str(),
+            "gradient" | "picture" | "wallpaper"
+        ) {
+            self.background_mode = "gradient".to_owned();
+        }
         if self.media_paths.is_empty() {
             self.media_paths = default_media_paths();
         }
@@ -206,6 +222,11 @@ impl Settings {
         let Ok(mut settings) = toml::from_str::<Self>(&contents) else {
             return (Self::default(), false);
         };
+        // Config written before background modes existed: a stored picture
+        // was always shown, so keep showing it.
+        if !contents.contains("background_mode") && settings.background_image.is_some() {
+            settings.background_mode = "picture".to_owned();
+        }
         let migrated = settings.version != CONFIG_VERSION;
         settings.normalize();
         (settings, migrated)

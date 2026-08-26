@@ -94,6 +94,7 @@ pub enum Action {
     Setting(SettingAction),
     Group(SettingsGroup),
     Wifi,
+    SystemInfo,
     Exit,
 }
 
@@ -134,9 +135,15 @@ pub enum SettingAction {
     Transparent,
     Waves,
     Sound,
+    SoundVolume,
     ReducedMotion,
     NetworkArtwork,
     Background,
+    BackgroundMode,
+    ThemePack,
+    Sparkles,
+    BootAnimation,
+    Clock24h,
     ResetAppearance,
     Binding(BindingTarget),
 }

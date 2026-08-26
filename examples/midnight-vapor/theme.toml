@@ -1,0 +1,23 @@
+# Midnight Vapor — a starter theme pack for the XMB launcher.
+# Copy this whole folder to make your own pack; every field is optional.
+
+name = "Midnight Vapor"
+author = "Aphrodine"
+
+# Accent tints the waves, sparkles, selection highlights, and boot wordmark.
+accent = "#9ee8ff"
+
+# Gradient override (both required, else the monthly palette is used).
+background_top = "#141a33"
+background_bottom = "#05070f"
+
+# A picture shipped with the pack, used when Background style = Picture and
+# no personal picture is set. Path is relative to this folder.
+# background_image = "background.jpg"
+
+# UI sounds (wav files relative to this folder). Uncomment to use.
+# sound_navigate = "sounds/navigate.wav"
+# sound_confirm  = "sounds/confirm.wav"
+# sound_back     = "sounds/back.wav"
+# sound_warning  = "sounds/warning.wav"
+# sound_boot     = "sounds/boot.wav"

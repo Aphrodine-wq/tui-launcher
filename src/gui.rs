@@ -20,7 +20,9 @@ use crate::{
     feedback::{AudioFeedback, Tone},
     input::{ControllerInput, InputAction},
     model::{Action, AppState, LibraryItem, Mode, SettingAction, SettingsGroup},
-    platform, sources, wifi,
+    platform, sources, sysinfo,
+    theme::{self, ThemePack},
+    wifi,
 };
 
 const FRAME_TIME: Duration = Duration::from_millis(16);
@@ -80,6 +82,8 @@ pub struct XmbApp {
     wave_time: f32,
     textures: HashMap<(PathBuf, TextureTier), TextureHandle>,
     submenu: Option<SubMenu>,
+    pack: Option<ThemePack>,
+    sysinfo_open: Option<Vec<(String, String)>>,
     wifi: Option<WifiUi>,
     wifi_tx: Sender<WifiEvent>,
     wifi_rx: Receiver<WifiEvent>,
@@ -133,11 +137,17 @@ impl XmbApp {
         if settings.network_artwork {
             spawn_steam_art_fetch(&state, art_tx.clone());
         }
+        let pack = settings.theme_pack.as_deref().and_then(theme::load);
         let audio = AudioFeedback::new();
         if settings.sound
+            && settings.boot_animation
             && let Some(audio) = &audio
         {
-            audio.play(Tone::Boot, settings.sound_volume);
+            audio.play_sample(
+                Tone::Boot,
+                settings.sound_volume,
+                pack.as_ref().and_then(|pack| pack.sound(Tone::Boot)),
+            );
         }
         Self {
             settings,
@@ -151,6 +161,8 @@ impl XmbApp {
             wave_time: 0.0,
             textures: HashMap::new(),
             submenu: None,
+            pack,
+            sysinfo_open: None,
             wifi: None,
             wifi_tx,
             wifi_rx,
@@ -325,6 +337,16 @@ impl XmbApp {
                 InputAction::Back | InputAction::Confirm | InputAction::Context
             ) {
                 self.information_open = false;
+                self.feedback(Tone::Back);
+            }
+            return;
+        }
+        if self.sysinfo_open.is_some() {
+            if matches!(
+                action,
+                InputAction::Back | InputAction::Confirm | InputAction::Context
+            ) {
+                self.sysinfo_open = None;
                 self.feedback(Tone::Back);
             }
             return;
@@ -667,6 +689,10 @@ impl XmbApp {
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
             Action::Wifi => self.open_wifi(),
+            Action::SystemInfo => {
+                self.sysinfo_open = Some(sysinfo::gather());
+                self.feedback(Tone::Confirm);
+            }
             Action::Setting(setting) => {
                 let setting = *setting;
                 let had_background = self.settings.background_image.is_some();
@@ -674,15 +700,45 @@ impl XmbApp {
                 self.controller
                     .set_bindings(self.settings.controller.clone());
                 self.refresh_settings_items();
-                if setting == SettingAction::Background {
-                    self.background_override = None;
-                    self.toast(if had_background {
-                        "Background cleared — monthly gradient restored"
-                    } else {
-                        "Pick one under Photo: △ Options → Set as background"
-                    });
-                } else {
-                    self.toast("Setting updated");
+                match setting {
+                    SettingAction::Background => {
+                        self.background_override = None;
+                        self.toast(if had_background {
+                            "Background cleared"
+                        } else {
+                            "Pick one under Photo: △ Options → Set as background"
+                        });
+                    }
+                    SettingAction::ThemePack => {
+                        self.pack = self.settings.theme_pack.as_deref().and_then(theme::load);
+                        let name = match self.pack.as_ref() {
+                            Some(pack) if !pack.author.is_empty() => {
+                                format!("{} by {}", pack.name, pack.author)
+                            }
+                            Some(pack) => pack.name.clone(),
+                            None => "Built-in".to_owned(),
+                        };
+                        self.refresh_settings_items();
+                        self.toast(format!("Theme: {name}"));
+                    }
+                    SettingAction::BackgroundMode => {
+                        let hint = match self.settings.background_mode.as_str() {
+                            "picture"
+                                if self.settings.background_image.is_none()
+                                    && self
+                                        .pack
+                                        .as_ref()
+                                        .is_none_or(|pack| pack.background.is_none()) =>
+                            {
+                                "Picture mode — set one under Photo: △ Options"
+                            }
+                            "picture" => "Background: picture",
+                            "wallpaper" => "Background: desktop wallpaper",
+                            _ => "Background: monthly gradient",
+                        };
+                        self.toast(hint);
+                    }
+                    _ => self.toast("Setting updated"),
                 }
                 self.feedback(Tone::Confirm);
             }
@@ -835,8 +891,21 @@ impl XmbApp {
         if self.settings.sound
             && let Some(audio) = &self.audio
         {
-            audio.play(tone, self.settings.sound_volume);
+            audio.play_sample(
+                tone,
+                self.settings.sound_volume,
+                self.pack.as_ref().and_then(|pack| pack.sound(tone)),
+            );
         }
+    }
+
+    /// The active accent: theme pack override, else the built-in palette.
+    fn accent(&self) -> Color32 {
+        self.pack
+            .as_ref()
+            .and_then(|pack| pack.accent)
+            .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+            .unwrap_or_else(|| accent_color(self.settings.accent))
     }
 
     fn toast(&mut self, message: impl Into<String>) {
@@ -863,21 +932,45 @@ impl XmbApp {
         if self.wifi.is_some() {
             self.draw_wifi_panel(ui, &painter, rect);
         }
+        if self.sysinfo_open.is_some() {
+            self.draw_sysinfo(&painter, rect);
+        }
         if let Some((message, _)) = &self.toast {
             draw_toast(&painter, rect, message);
         }
         if !self.settings.reduced_motion
+            && self.settings.boot_animation
             && let Some((veil, wordmark)) = boot_phase(self.boot_at.elapsed().as_secs_f32())
         {
-            draw_boot(&painter, rect, veil, wordmark, self.settings.accent);
+            draw_boot(&painter, rect, veil, wordmark, self.accent());
         }
     }
 
     fn paint_backdrop(&mut self, ctx: &egui::Context, painter: &egui::Painter, rect: Rect) {
-        let background = self
-            .background_override
-            .clone()
-            .or_else(|| self.settings.background_image.clone());
+        let accent = self.accent();
+        let pack_gradient = self.pack.as_ref().and_then(|pack| pack.gradient);
+        if self.settings.background_mode == "wallpaper" && self.background_override.is_none() {
+            // See-through: no gradient, no picture — the desktop wallpaper
+            // (termpaper animation) shows through the transparent surface,
+            // under a light scrim that keeps text and waves legible.
+            painter.add(egui::epaint::RectShape::filled(
+                rect.shrink(1.0),
+                egui::CornerRadius::same(26),
+                Color32::from_black_alpha(64),
+            ));
+            paint_background(painter, rect, self.wave_time, &self.settings, true, accent, None);
+            return;
+        }
+        let background = self.background_override.clone().or_else(|| {
+            if self.settings.background_mode != "picture" {
+                return None;
+            }
+            self.settings.background_image.clone().or_else(|| {
+                self.pack
+                    .as_ref()
+                    .and_then(|pack| pack.background.clone())
+            })
+        });
         let mut image_drawn = false;
         if let Some(path) = background
             && let Some(texture) = self.texture_for(ctx, &path, TextureTier::Full)
@@ -902,7 +995,15 @@ impl XmbApp {
             ));
             image_drawn = true;
         }
-        paint_background(painter, rect, self.wave_time, &self.settings, image_drawn);
+        paint_background(
+            painter,
+            rect,
+            self.wave_time,
+            &self.settings,
+            image_drawn,
+            accent,
+            pack_gradient,
+        );
     }
 
     fn draw_status(&self, painter: &egui::Painter, rect: Rect) {
@@ -931,7 +1032,15 @@ impl XmbApp {
         if let Some(battery) = &self.state.system_status.battery {
             pieces.push(battery.clone());
         }
-        pieces.push(Local::now().format("%-m/%-d %-I:%M %p").to_string());
+        pieces.push(
+            Local::now()
+                .format(if self.settings.clock_24h {
+                    "%-m/%-d %H:%M"
+                } else {
+                    "%-m/%-d %-I:%M %p"
+                })
+                .to_string(),
+        );
         shadow_text(
             painter,
             Pos2::new(rect.right() - 42.0, top),
@@ -967,7 +1076,9 @@ impl XmbApp {
                 self.state.mode = mode;
                 self.options_open = false;
             }
-            shadow_icon(
+            let ctx = ui.ctx().clone();
+            self.draw_mode_icon(
+                &ctx,
                 painter,
                 mode,
                 Pos2::new(x, center.y),
@@ -1081,7 +1192,8 @@ impl XmbApp {
                 } else {
                     Color32::from_gray(105)
                 };
-                shadow_icon(painter, mode, Pos2::new(anchor.x, y), icon_size, color);
+                let ctx = ui.ctx().clone();
+                self.draw_mode_icon(&ctx, painter, mode, Pos2::new(anchor.x, y), icon_size, color);
             }
             if active {
                 shadow_text(
@@ -1110,12 +1222,115 @@ impl XmbApp {
         }
     }
 
+    /// The About screen: label/value rows in the settings-menu language.
+    fn draw_sysinfo(&self, painter: &egui::Painter, rect: Rect) {
+        let Some(rows) = &self.sysinfo_open else {
+            return;
+        };
+        let accent = self.accent();
+        let row_height = 40.0;
+        let header = 46.0;
+        let panel = Rect::from_center_size(
+            rect.center(),
+            Vec2::new(
+                (rect.width() * 0.46).clamp(430.0, 620.0),
+                header + rows.len() as f32 * row_height + 22.0,
+            ),
+        );
+        painter.rect_filled(panel, 12.0, Color32::from_black_alpha(210));
+        painter.rect_stroke(
+            panel,
+            12.0,
+            Stroke::new(1.0, Color32::from_white_alpha(70)),
+            egui::StrokeKind::Inside,
+        );
+        shadow_text(
+            painter,
+            Pos2::new(panel.left() + 22.0, panel.top() + 26.0),
+            Align2::LEFT_CENTER,
+            "SYSTEM INFORMATION",
+            FontId::proportional(12.0),
+            tint(accent, 220),
+        );
+        shadow_text(
+            painter,
+            Pos2::new(panel.right() - 22.0, panel.top() + 26.0),
+            Align2::RIGHT_CENTER,
+            "○ Back",
+            FontId::proportional(11.0),
+            Color32::from_white_alpha(130),
+        );
+        for (index, (label, value)) in rows.iter().enumerate() {
+            let y = panel.top() + header + index as f32 * row_height + row_height / 2.0;
+            shadow_text(
+                painter,
+                Pos2::new(panel.left() + 22.0, y),
+                Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(13.0),
+                Color32::from_white_alpha(150),
+            );
+            shadow_text(
+                painter,
+                Pos2::new(panel.right() - 22.0, y),
+                Align2::RIGHT_CENTER,
+                &truncate(value, 44),
+                FontId::proportional(14.0),
+                Color32::WHITE,
+            );
+        }
+    }
+
+    /// Draw a category icon: the theme pack's image when it provides one,
+    /// otherwise the built-in procedural drawing.
+    fn draw_mode_icon(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        mode: Mode,
+        center: Pos2,
+        size: f32,
+        color: Color32,
+    ) {
+        let icon = self
+            .pack
+            .as_ref()
+            .and_then(|pack| pack.icon(mode))
+            .cloned()
+            .and_then(|path| {
+                self.texture_for(ctx, &path, TextureTier::Thumb)
+                    .map(|texture| (texture.id(), texture.size_vec2()))
+            });
+        if let Some((texture_id, source)) = icon {
+            let display = fit_size(source, Vec2::splat(size), 3.0);
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            painter.add(
+                egui::epaint::RectShape::filled(
+                    Rect::from_center_size(center + Vec2::new(1.2, 1.5), display),
+                    egui::CornerRadius::ZERO,
+                    Color32::from_black_alpha(color.a().saturating_sub(60)),
+                )
+                .with_texture(texture_id, uv),
+            );
+            painter.add(
+                egui::epaint::RectShape::filled(
+                    Rect::from_center_size(center, display),
+                    egui::CornerRadius::ZERO,
+                    color,
+                )
+                .with_texture(texture_id, uv),
+            );
+        } else {
+            shadow_icon(painter, mode, center, size, color);
+        }
+    }
+
     /// Settings render as a proper menu panel — a rounded card with
     /// highlighted rows and right-aligned values — instead of sparse XMB
     /// items. Covers both the group list and an open group.
     fn draw_settings_menu(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
-        if self.wifi.is_some() {
-            // The Wi-Fi panel replaces the menu in the same spot.
+        if self.wifi.is_some() || self.sysinfo_open.is_some() {
+            // The Wi-Fi and System Information panels replace the menu.
             return;
         }
         let (title, items, selection, position, in_submenu) = match &self.submenu {
@@ -1143,7 +1358,7 @@ impl XmbApp {
         if items.is_empty() {
             return;
         }
-        let accent = accent_color(self.settings.accent);
+        let accent = self.accent();
         let spine = rect.center().x - rect.width() * 0.08;
         let panel_width = (rect.width() * 0.52).clamp(430.0, 660.0);
         let header = 44.0;
@@ -1276,7 +1491,7 @@ impl XmbApp {
         let Some(wifi_ui) = &self.wifi else {
             return;
         };
-        let accent = accent_color(self.settings.accent);
+        let accent = self.accent();
         let networks = wifi_ui.networks.clone();
         let selection = wifi_ui.selection;
         let position = wifi_ui.position;
@@ -1906,15 +2121,25 @@ fn paint_background(
     rect: Rect,
     time: f32,
     settings: &Settings,
-    image_drawn: bool,
+    skip_gradient: bool,
+    accent: Color32,
+    pack_gradient: Option<([u8; 3], [u8; 3])>,
 ) {
     let inset = rect.shrink(1.0);
-    if !image_drawn {
-        let [top, bottom] = monthly_palette(
-            Local::now().month0() as usize,
-            settings.theme,
-            settings.transparent,
-        );
+    if !skip_gradient {
+        let [top_alpha, bottom_alpha]: [u8; 2] =
+            if settings.transparent { [238, 246] } else { [255, 255] };
+        let [top, bottom] = match pack_gradient {
+            Some((top, bottom)) => [
+                Color32::from_rgba_premultiplied(top[0], top[1], top[2], top_alpha),
+                Color32::from_rgba_premultiplied(bottom[0], bottom[1], bottom[2], bottom_alpha),
+            ],
+            None => monthly_palette(
+                Local::now().month0() as usize,
+                settings.theme,
+                settings.transparent,
+            ),
+        };
         let mut mesh = Mesh::default();
         mesh.colored_vertex(inset.left_top(), top);
         mesh.colored_vertex(inset.right_top(), top);
@@ -1931,9 +2156,10 @@ fn paint_background(
         egui::StrokeKind::Inside,
     );
     if settings.waves {
-        let accent = accent_color(settings.accent);
         paint_wave_ribbons(painter, rect, time, accent);
-        paint_sparkles(painter, rect, time, accent);
+        if settings.sparkles {
+            paint_sparkles(painter, rect, time, accent);
+        }
     }
 }
 
@@ -2207,7 +2433,7 @@ fn boot_phase(elapsed: f32) -> Option<(u8, u8)> {
     Some(((veil * 255.0) as u8, (wordmark * 255.0) as u8))
 }
 
-fn draw_boot(painter: &egui::Painter, rect: Rect, veil: u8, wordmark: u8, accent: usize) {
+fn draw_boot(painter: &egui::Painter, rect: Rect, veil: u8, wordmark: u8, accent: Color32) {
     if veil > 0 {
         painter.rect_filled(rect.shrink(1.0), 26.0, Color32::from_black_alpha(veil));
     }
@@ -2227,7 +2453,7 @@ fn draw_boot(painter: &egui::Painter, rect: Rect, veil: u8, wordmark: u8, accent
             Align2::CENTER_CENTER,
             "L A U N C H E R",
             FontId::proportional(15.0),
-            tint(accent_color(accent), wordmark.saturating_sub(45)),
+            tint(accent, wordmark.saturating_sub(45)),
         );
     }
 }
@@ -2306,6 +2532,32 @@ fn adjust_setting(action: SettingAction, settings: &mut Settings) {
         SettingAction::ReducedMotion => settings.reduced_motion = !settings.reduced_motion,
         SettingAction::NetworkArtwork => settings.network_artwork = !settings.network_artwork,
         SettingAction::Background => settings.background_image = None,
+        SettingAction::BackgroundMode => {
+            settings.background_mode = match settings.background_mode.as_str() {
+                "gradient" => "picture",
+                "picture" => "wallpaper",
+                _ => "gradient",
+            }
+            .to_owned();
+        }
+        SettingAction::ThemePack => {
+            let packs = theme::list_packs();
+            settings.theme_pack = match &settings.theme_pack {
+                None => packs.first().cloned(),
+                Some(current) => packs
+                    .iter()
+                    .position(|pack| pack == current)
+                    .and_then(|index| packs.get(index + 1))
+                    .cloned(),
+            };
+        }
+        SettingAction::Sparkles => settings.sparkles = !settings.sparkles,
+        SettingAction::SoundVolume => {
+            let step = ((settings.sound_volume * 4.0).round() as u32 + 1) % 5;
+            settings.sound_volume = step as f32 / 4.0;
+        }
+        SettingAction::BootAnimation => settings.boot_animation = !settings.boot_animation,
+        SettingAction::Clock24h => settings.clock_24h = !settings.clock_24h,
         SettingAction::ResetAppearance => {
             let defaults = Settings::default();
             settings.theme = defaults.theme;
@@ -2314,6 +2566,10 @@ fn adjust_setting(action: SettingAction, settings: &mut Settings) {
             settings.waves = defaults.waves;
             settings.reduced_motion = defaults.reduced_motion;
             settings.background_image = None;
+            settings.background_mode = defaults.background_mode;
+            settings.theme_pack = None;
+            settings.sparkles = defaults.sparkles;
+            settings.boot_animation = defaults.boot_animation;
         }
         SettingAction::Binding(target) => settings.controller.cycle(target),
     }

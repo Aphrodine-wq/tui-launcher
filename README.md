@@ -17,7 +17,13 @@ The category order follows the PSP home menu:
 
 The native overlay opens as a centered, borderless 16:9 window. Categories move horizontally while the selected category remains at the visual anchor; its content forms the vertical part of the XMB, and items above the selection jump over the category crossbar the way the original interface does. Category icons are original vector drawings rendered at any size. Selection motion and the background are time-based and independent of frame rate.
 
-The background is a monthly gradient crossed by filled, glowing wave ribbons with drifting sparkles. The wave accent setting tints the ribbons, sparkles, and boot wordmark (Classic, Aqua, Amber, Rose, Emerald). The transparent-overlay setting switches between a translucent and a fully opaque background. Reduced-motion mode freezes the waves, disables animated transitions, and skips the short boot-in animation.
+The background is a monthly gradient crossed by filled, glowing wave ribbons with drifting sparkles. The wave accent setting tints the ribbons, sparkles, and boot wordmark (Classic, Aqua, Amber, Rose, Emerald). The transparent-overlay setting switches between a translucent and a fully opaque background. Reduced-motion mode freezes the waves, disables animated transitions, and skips the short boot-in animation. Sparkles, sound volume, the boot animation, and the clock format (12/24h) are individually adjustable, and Settings → System → System Information shows an about screen for the machine and launcher.
+
+**Background styles**: *Monthly gradient*, *Picture*, or *Desktop wallpaper (see-through)* — the last paints no background at all, so an animated wallpaper running behind the launcher (such as termpaper via hyprwinwrap) shows through live beneath the waves. When the launcher window is placed by a Hyprland rule, use `fullscreen_state 1 2` rather than `fullscreen on`: hyprwinwrap suspends background windows on monitors with an internally-fullscreen window.
+
+**Theme packs** are the modding format: a folder in `${XDG_CONFIG_HOME:-~/.config}/tui-launcher/themes/<name>/` containing a `theme.toml` (accent, gradient, background picture, WAV interface sounds — all optional) and an `icons/` directory of per-category SVG/PNG icons that replace the built-in drawn icons. Share a pack by zipping the folder; install one by dropping it in. Select packs under Settings → Appearance → Theme pack. A documented starter pack ships in `examples/midnight-vapor/`.
+
+The Network category identifies the actual default web browser (via `xdg-settings`) with its real name and icon.
 
 Any photo can become the background: select it under **Photo**, open Options, and choose "Set as Background". The picture is drawn aspect-filled behind a legibility scrim with the waves on top, and Appearance → Background picture clears it back to the monthly gradient. `--background PATH` previews a picture for one run without saving it.
 

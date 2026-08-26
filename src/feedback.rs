@@ -29,6 +29,18 @@ impl AudioFeedback {
         })
     }
 
+    /// Play a theme pack's audio sample for this tone, or the built-in
+    /// synthesized notes when the pack has none (or fails to decode).
+    pub fn play_sample(&self, tone: Tone, volume: f32, sample: Option<&[u8]>) {
+        if let Some(bytes) = sample
+            && let Ok(source) = rodio::Decoder::new(std::io::Cursor::new(bytes.to_vec()))
+        {
+            self.player.append(source.amplify(volume.clamp(0.0, 1.0)));
+            return;
+        }
+        self.play(tone, volume);
+    }
+
     pub fn play(&self, tone: Tone, volume: f32) {
         let notes: &[(f32, u64)] = match tone {
             Tone::Navigate => &[(520.0, 34)],

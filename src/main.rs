@@ -5,6 +5,8 @@ mod input;
 mod model;
 mod platform;
 mod sources;
+mod sysinfo;
+mod theme;
 mod wifi;
 
 use anyhow::Result;

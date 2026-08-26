@@ -103,7 +103,7 @@ pub fn settings_group_items(
     match group {
         SettingsGroup::Appearance => setting_items(settings),
         SettingsGroup::Controller => controller_items(settings),
-        SettingsGroup::System => system_control_items(),
+        SettingsGroup::System => system_control_items(settings),
         SettingsGroup::Power => power_items(),
     }
 }
@@ -351,7 +351,11 @@ pub fn discover_media(roots: &[PathBuf], requested: MediaKind) -> Vec<LibraryIte
 
 pub fn network_items() -> Vec<LibraryItem> {
     // Network configuration lives under Settings → System; the category
-    // keeps the browser, like the original home menu.
+    // keeps the browser, like the original home menu. The row identifies
+    // the user's actual default browser with its real name and icon.
+    if let Some(browser) = resolved_default_browser() {
+        return vec![browser];
+    }
     let mut browser = LibraryItem::simple(
         "network:browser",
         "Internet Browser",
@@ -365,6 +369,41 @@ pub fn network_items() -> Vec<LibraryItem> {
         browser = browser.unavailable("xdg-open is unavailable");
     }
     vec![browser]
+}
+
+fn resolved_default_browser() -> Option<LibraryItem> {
+    let output = Command::new("xdg-settings")
+        .args(["get", "default-web-browser"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let id = id.trim_end_matches(".desktop");
+    if id.is_empty() {
+        return None;
+    }
+    let locales = get_languages_from_env();
+    for path in freedesktop_desktop_entry::Iter::new(default_paths()) {
+        let Ok(entry) = DesktopEntry::from_path(&path, Some(&locales)) else {
+            continue;
+        };
+        if !entry.id().eq_ignore_ascii_case(id) {
+            continue;
+        }
+        let name = entry.name(&locales)?.into_owned();
+        let mut item =
+            LibraryItem::simple("network:browser", name, Action::Desktop(path.clone()));
+        item.subtitle = system_status()
+            .network
+            .map(|status| format!("{status} — default browser"))
+            .unwrap_or_else(|| "Default browser".to_owned());
+        item.art = entry.icon().and_then(resolve_icon);
+        item.details = vec![entry.id().to_owned(), path.display().to_string()];
+        return Some(item);
+    }
+    None
 }
 
 fn wifi_item() -> LibraryItem {
@@ -505,7 +544,7 @@ fn volume_status() -> Option<String> {
     None
 }
 
-pub fn system_control_items() -> Vec<LibraryItem> {
+pub fn system_control_items(settings: &Settings) -> Vec<LibraryItem> {
     let mut items = vec![wifi_item(), network_settings_item()];
     add_control(
         &mut items,
@@ -572,6 +611,21 @@ pub fn system_control_items() -> Vec<LibraryItem> {
         profiles,
         "powerprofilesctl is unavailable",
     );
+    let mut clock = LibraryItem::simple(
+        "setting:clock",
+        "Clock format",
+        Action::Setting(SettingAction::Clock24h),
+    );
+    clock.subtitle = if settings.clock_24h {
+        "24-hour"
+    } else {
+        "12-hour"
+    }
+    .to_owned();
+    items.push(clock);
+    let mut info = LibraryItem::simple("system:information", "System Information", Action::SystemInfo);
+    info.subtitle = "About this machine and launcher".to_owned();
+    items.push(info);
     items
 }
 
@@ -646,6 +700,26 @@ pub fn setting_items(settings: &Settings) -> Vec<LibraryItem> {
             SettingAction::Accent,
         ),
         (
+            "theme-pack",
+            "Theme pack",
+            settings
+                .theme_pack
+                .clone()
+                .unwrap_or_else(|| "Built-in".to_owned()),
+            SettingAction::ThemePack,
+        ),
+        (
+            "background-mode",
+            "Background style",
+            match settings.background_mode.as_str() {
+                "picture" => "Picture",
+                "wallpaper" => "Desktop wallpaper (see-through)",
+                _ => "Monthly gradient",
+            }
+            .to_owned(),
+            SettingAction::BackgroundMode,
+        ),
+        (
             "background",
             "Background picture",
             settings
@@ -669,10 +743,28 @@ pub fn setting_items(settings: &Settings) -> Vec<LibraryItem> {
             SettingAction::Waves,
         ),
         (
+            "sparkles",
+            "Wave sparkles",
+            on_off(settings.sparkles),
+            SettingAction::Sparkles,
+        ),
+        (
             "sound",
             "Interface sound",
             on_off(settings.sound),
             SettingAction::Sound,
+        ),
+        (
+            "sound-volume",
+            "Sound volume",
+            format!("{:.0}%", settings.sound_volume * 100.0),
+            SettingAction::SoundVolume,
+        ),
+        (
+            "boot-animation",
+            "Boot animation",
+            on_off(settings.boot_animation),
+            SettingAction::BootAnimation,
         ),
         (
             "reduced-motion",
