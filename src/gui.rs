@@ -20,7 +20,7 @@ use crate::{
     feedback::{AudioFeedback, Tone},
     input::{ControllerInput, InputAction},
     model::{Action, AppState, LibraryItem, Mode, SettingAction, SettingsGroup},
-    platform, sources,
+    platform, sources, wifi,
 };
 
 const FRAME_TIME: Duration = Duration::from_millis(16);
@@ -48,6 +48,26 @@ enum OptionEntry {
     Close,
 }
 
+/// State for the native Wi-Fi panel (iwd backed), opened from
+/// Settings → System → Wi-Fi Networks.
+#[derive(Default)]
+struct WifiUi {
+    device: Option<String>,
+    networks: Vec<wifi::WifiNetwork>,
+    selection: usize,
+    position: f32,
+    refreshing: bool,
+    busy: Option<String>,
+    status: Option<String>,
+    password_for: Option<String>,
+    password: String,
+}
+
+enum WifiEvent {
+    Snapshot(wifi::WifiSnapshot),
+    Outcome { message: String, ok: bool },
+}
+
 pub struct XmbApp {
     settings: Settings,
     migrated: bool,
@@ -60,6 +80,9 @@ pub struct XmbApp {
     wave_time: f32,
     textures: HashMap<(PathBuf, TextureTier), TextureHandle>,
     submenu: Option<SubMenu>,
+    wifi: Option<WifiUi>,
+    wifi_tx: Sender<WifiEvent>,
+    wifi_rx: Receiver<WifiEvent>,
     background_override: Option<PathBuf>,
     generated_art: HashMap<String, Option<PathBuf>>,
     art_pending: HashSet<String>,
@@ -106,6 +129,7 @@ impl XmbApp {
             .collect();
         let (message_tx, message_rx) = mpsc::channel();
         let (art_tx, art_rx) = mpsc::channel();
+        let (wifi_tx, wifi_rx) = mpsc::channel();
         if settings.network_artwork {
             spawn_steam_art_fetch(&state, art_tx.clone());
         }
@@ -127,6 +151,9 @@ impl XmbApp {
             wave_time: 0.0,
             textures: HashMap::new(),
             submenu: None,
+            wifi: None,
+            wifi_tx,
+            wifi_rx,
             background_override,
             generated_art: HashMap::new(),
             art_pending: HashSet::new(),
@@ -173,6 +200,44 @@ impl XmbApp {
                 ease(submenu.position, target, dt, 15.0)
             };
         }
+        if let Some(wifi_ui) = &mut self.wifi {
+            let target = wifi_ui.selection as f32;
+            wifi_ui.position = if self.settings.reduced_motion {
+                target
+            } else {
+                ease(wifi_ui.position, target, dt, 15.0)
+            };
+        }
+        let mut wifi_outcomes = Vec::new();
+        while let Ok(event) = self.wifi_rx.try_recv() {
+            match event {
+                WifiEvent::Snapshot(snapshot) => {
+                    if let Some(wifi_ui) = &mut self.wifi {
+                        wifi_ui.device = snapshot.device;
+                        wifi_ui.status = snapshot.error;
+                        wifi_ui.refreshing = false;
+                        if !snapshot.networks.is_empty() || wifi_ui.status.is_some() {
+                            wifi_ui.networks = snapshot.networks;
+                            wifi_ui.selection = wifi_ui
+                                .selection
+                                .min(wifi_ui.networks.len().saturating_sub(1));
+                        }
+                    }
+                }
+                WifiEvent::Outcome { message, ok } => wifi_outcomes.push((message, ok)),
+            }
+        }
+        for (message, ok) in wifi_outcomes {
+            if let Some(wifi_ui) = &mut self.wifi {
+                wifi_ui.busy = None;
+            }
+            self.toast(message);
+            self.feedback(if ok { Tone::Confirm } else { Tone::Warning });
+            if ok {
+                self.spawn_wifi_refresh(false);
+                self.state.system_status = sources::system_status();
+            }
+        }
         self.state.controller_name = self.controller.name.clone();
 
         if self.last_status_refresh.elapsed() >= Duration::from_secs(5) {
@@ -208,22 +273,45 @@ impl XmbApp {
             .filter(|event| event.pressed)
             .map(|event| event.action)
             .collect::<Vec<_>>();
+        let typing = self
+            .wifi
+            .as_ref()
+            .is_some_and(|wifi_ui| wifi_ui.password_for.is_some());
         ctx.input(|input| {
-            let keys = [
-                (Key::ArrowLeft, InputAction::PreviousMode),
-                (Key::ArrowRight, InputAction::NextMode),
-                (Key::ArrowUp, InputAction::PreviousItem),
-                (Key::ArrowDown, InputAction::NextItem),
-                (Key::Enter, InputAction::Confirm),
-                (Key::Space, InputAction::Confirm),
-                (Key::Escape, InputAction::Back),
-                (Key::T, InputAction::Context),
-                (Key::F, InputAction::Favorite),
-                (Key::S, InputAction::Settings),
-            ];
+            // While a password prompt is open, letters and Space belong to
+            // the passphrase, so only Enter and Escape act as controls.
+            let keys: &[(Key, InputAction)] = if typing {
+                &[
+                    (Key::Enter, InputAction::Confirm),
+                    (Key::Escape, InputAction::Back),
+                ]
+            } else {
+                &[
+                    (Key::ArrowLeft, InputAction::PreviousMode),
+                    (Key::ArrowRight, InputAction::NextMode),
+                    (Key::ArrowUp, InputAction::PreviousItem),
+                    (Key::ArrowDown, InputAction::NextItem),
+                    (Key::Enter, InputAction::Confirm),
+                    (Key::Space, InputAction::Confirm),
+                    (Key::Escape, InputAction::Back),
+                    (Key::T, InputAction::Context),
+                    (Key::F, InputAction::Favorite),
+                    (Key::S, InputAction::Settings),
+                ]
+            };
             for (key, action) in keys {
-                if input.key_pressed(key) {
-                    actions.push(action);
+                if input.key_pressed(*key) {
+                    actions.push(*action);
+                }
+            }
+            if typing && let Some(wifi_ui) = &mut self.wifi {
+                for event in &input.events {
+                    if let egui::Event::Text(text) = event {
+                        wifi_ui.password.push_str(text);
+                    }
+                }
+                if input.key_pressed(Key::Backspace) {
+                    wifi_ui.password.pop();
                 }
             }
         });
@@ -251,6 +339,10 @@ impl XmbApp {
                 InputAction::Back => self.pending_destructive = None,
                 _ => {}
             }
+            return;
+        }
+        if self.wifi.is_some() {
+            self.handle_wifi_action(action);
             return;
         }
         if self.options_open {
@@ -398,6 +490,149 @@ impl XmbApp {
         }
     }
 
+    fn handle_wifi_action(&mut self, action: InputAction) {
+        let Some(wifi_ui) = &mut self.wifi else {
+            return;
+        };
+        if wifi_ui.password_for.is_some() {
+            match action {
+                InputAction::Confirm => {
+                    let Some(wifi_ui) = &mut self.wifi else {
+                        return;
+                    };
+                    let Some(ssid) = wifi_ui.password_for.take() else {
+                        return;
+                    };
+                    let passphrase = std::mem::take(&mut wifi_ui.password);
+                    if passphrase.is_empty() {
+                        wifi_ui.password_for = Some(ssid);
+                        self.feedback(Tone::Warning);
+                        return;
+                    }
+                    self.wifi_connect(ssid, Some(passphrase));
+                }
+                InputAction::Back => {
+                    wifi_ui.password_for = None;
+                    wifi_ui.password.clear();
+                    self.feedback(Tone::Back);
+                }
+                _ => {}
+            }
+            return;
+        }
+        match action {
+            InputAction::PreviousItem | InputAction::NextItem => {
+                let len = wifi_ui.networks.len();
+                if len > 0 {
+                    let delta: isize = if matches!(action, InputAction::PreviousItem) {
+                        -1
+                    } else {
+                        1
+                    };
+                    wifi_ui.selection =
+                        (wifi_ui.selection as isize + delta).rem_euclid(len as isize) as usize;
+                }
+                self.feedback(Tone::Navigate);
+            }
+            InputAction::Context => {
+                if !wifi_ui.refreshing {
+                    wifi_ui.refreshing = true;
+                    self.spawn_wifi_refresh(true);
+                    self.feedback(Tone::Navigate);
+                }
+            }
+            InputAction::Back => {
+                self.wifi = None;
+                self.feedback(Tone::Back);
+            }
+            InputAction::Confirm => {
+                if wifi_ui.busy.is_some() {
+                    return;
+                }
+                let Some(network) = wifi_ui.networks.get(wifi_ui.selection).cloned() else {
+                    return;
+                };
+                if network.connected {
+                    self.wifi_disconnect();
+                } else if network.known || !network.secured() {
+                    self.wifi_connect(network.ssid, None);
+                } else {
+                    wifi_ui.password_for = Some(network.ssid);
+                    wifi_ui.password.clear();
+                    self.feedback(Tone::Confirm);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn open_wifi(&mut self) {
+        self.wifi = Some(WifiUi {
+            refreshing: true,
+            ..WifiUi::default()
+        });
+        // Quick cached listing first, then a proper rescan.
+        let sender = self.wifi_tx.clone();
+        thread::spawn(move || {
+            let _ = sender.send(WifiEvent::Snapshot(wifi::snapshot(false)));
+            let _ = sender.send(WifiEvent::Snapshot(wifi::snapshot(true)));
+        });
+        self.feedback(Tone::Confirm);
+    }
+
+    fn spawn_wifi_refresh(&self, rescan: bool) {
+        let sender = self.wifi_tx.clone();
+        thread::spawn(move || {
+            let _ = sender.send(WifiEvent::Snapshot(wifi::snapshot(rescan)));
+        });
+    }
+
+    fn wifi_connect(&mut self, ssid: String, passphrase: Option<String>) {
+        let Some(wifi_ui) = &mut self.wifi else {
+            return;
+        };
+        let Some(device) = wifi_ui.device.clone() else {
+            self.toast("No wireless device available");
+            self.feedback(Tone::Warning);
+            return;
+        };
+        wifi_ui.busy = Some(format!("Connecting to {ssid}…"));
+        let sender = self.wifi_tx.clone();
+        thread::spawn(move || {
+            let event = match wifi::connect(&device, &ssid, passphrase.as_deref()) {
+                Ok(message) => WifiEvent::Outcome { message, ok: true },
+                Err(error) => WifiEvent::Outcome {
+                    message: format!("Could not connect: {error}"),
+                    ok: false,
+                },
+            };
+            let _ = sender.send(event);
+        });
+        self.feedback(Tone::Confirm);
+    }
+
+    fn wifi_disconnect(&mut self) {
+        let Some(wifi_ui) = &mut self.wifi else {
+            return;
+        };
+        let Some(device) = wifi_ui.device.clone() else {
+            return;
+        };
+        wifi_ui.busy = Some("Disconnecting…".to_owned());
+        let sender = self.wifi_tx.clone();
+        thread::spawn(move || {
+            let event = match wifi::disconnect(&device) {
+                Ok(message) => WifiEvent::Outcome { message, ok: true },
+                Err(error) => WifiEvent::Outcome {
+                    message: format!("Could not disconnect: {error}"),
+                    ok: false,
+                },
+            };
+            let _ = sender.send(event);
+        });
+        self.feedback(Tone::Confirm);
+    }
+
     fn open_submenu(&mut self, group: SettingsGroup) {
         let items = sources::settings_group_items(group, &self.settings);
         self.submenu = Some(SubMenu {
@@ -431,6 +666,7 @@ impl XmbApp {
                 self.feedback(Tone::Back);
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
+            Action::Wifi => self.open_wifi(),
             Action::Setting(setting) => {
                 let setting = *setting;
                 let had_background = self.settings.background_image.is_some();
@@ -487,6 +723,10 @@ impl XmbApp {
         if item.action == Action::Exit {
             self.feedback(Tone::Back);
             ctx.send_viewport_cmd(ViewportCommand::Close);
+            return;
+        }
+        if item.action == Action::Wifi {
+            self.open_wifi();
             return;
         }
         if let Action::Setting(action) = item.action {
@@ -619,6 +859,9 @@ impl XmbApp {
         }
         if let Some(action) = &self.pending_destructive {
             self.draw_confirmation(&painter, rect, action);
+        }
+        if self.wifi.is_some() {
+            self.draw_wifi_panel(ui, &painter, rect);
         }
         if let Some((message, _)) = &self.toast {
             draw_toast(&painter, rect, message);
@@ -871,6 +1114,10 @@ impl XmbApp {
     /// highlighted rows and right-aligned values — instead of sparse XMB
     /// items. Covers both the group list and an open group.
     fn draw_settings_menu(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
+        if self.wifi.is_some() {
+            // The Wi-Fi panel replaces the menu in the same spot.
+            return;
+        }
         let (title, items, selection, position, in_submenu) = match &self.submenu {
             Some(submenu) => (
                 submenu.group.title().to_owned(),
@@ -1022,6 +1269,221 @@ impl XmbApp {
         }
     }
 
+    /// The native Wi-Fi manager, drawn in the same menu language as the
+    /// settings panel: network rows with drawn signal bars, and a keyboard
+    /// password prompt for new secured networks.
+    fn draw_wifi_panel(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
+        let Some(wifi_ui) = &self.wifi else {
+            return;
+        };
+        let accent = accent_color(self.settings.accent);
+        let networks = wifi_ui.networks.clone();
+        let selection = wifi_ui.selection;
+        let position = wifi_ui.position;
+        let footer_line = if let Some(busy) = &wifi_ui.busy {
+            busy.clone()
+        } else if wifi_ui.refreshing {
+            "Scanning…".to_owned()
+        } else if let Some(status) = &wifi_ui.status {
+            status.clone()
+        } else {
+            format!(
+                "{} network{}",
+                networks.len(),
+                if networks.len() == 1 { "" } else { "s" }
+            )
+        };
+        let device_label = wifi_ui.device.clone().unwrap_or_default();
+        let password_prompt = wifi_ui
+            .password_for
+            .clone()
+            .map(|ssid| (ssid, wifi_ui.password.chars().count()));
+
+        let spine = rect.center().x - rect.width() * 0.08;
+        let panel_width = (rect.width() * 0.52).clamp(430.0, 660.0);
+        let header = 44.0;
+        let row_height = 44.0;
+        let footer_height = 34.0;
+        let top = rect.top() + rect.height() * 0.42;
+        let max_bottom = rect.bottom() - rect.height() * 0.11;
+        let content_bottom =
+            top + header + (networks.len().max(1)) as f32 * row_height + footer_height + 8.0;
+        let panel = Rect::from_min_max(
+            Pos2::new(spine - 58.0, top),
+            Pos2::new(
+                (spine - 58.0 + panel_width).min(rect.right() - 30.0),
+                content_bottom.min(max_bottom),
+            ),
+        );
+        painter.rect_filled(panel, 12.0, Color32::from_black_alpha(178));
+        painter.rect_stroke(
+            panel,
+            12.0,
+            Stroke::new(1.0, Color32::from_white_alpha(58)),
+            egui::StrokeKind::Inside,
+        );
+        shadow_text(
+            painter,
+            Pos2::new(panel.left() + 22.0, panel.top() + 25.0),
+            Align2::LEFT_CENTER,
+            "WI-FI NETWORKS",
+            FontId::proportional(12.0),
+            Color32::from_white_alpha(150),
+        );
+        shadow_text(
+            painter,
+            Pos2::new(panel.right() - 22.0, panel.top() + 25.0),
+            Align2::RIGHT_CENTER,
+            &device_label,
+            FontId::proportional(11.0),
+            Color32::from_white_alpha(120),
+        );
+        let list = Rect::from_min_max(
+            Pos2::new(panel.left(), panel.top() + header),
+            Pos2::new(panel.right(), panel.bottom() - footer_height),
+        );
+        let clipped = painter.with_clip_rect(list);
+        if networks.is_empty() {
+            shadow_text(
+                &clipped,
+                list.center(),
+                Align2::CENTER_CENTER,
+                if wifi_ui.refreshing { "Scanning…" } else { "No networks found" },
+                FontId::proportional(14.0),
+                Color32::from_white_alpha(160),
+            );
+        }
+        let visible = (list.height() / row_height).floor().max(1.0);
+        let max_scroll = ((networks.len() as f32 - visible) * row_height).max(0.0);
+        let scroll = (((position + 0.5) - visible / 2.0) * row_height).clamp(0.0, max_scroll);
+        for (index, network) in networks.iter().enumerate() {
+            let y = list.top() + index as f32 * row_height - scroll;
+            if y + row_height < list.top() || y > list.bottom() {
+                continue;
+            }
+            let row = Rect::from_min_size(
+                Pos2::new(panel.left() + 10.0, y + 3.0),
+                Vec2::new(panel.width() - 20.0, row_height - 6.0),
+            );
+            if ui
+                .interact(row, ui.id().with(("wifi-row", index)), Sense::click())
+                .clicked()
+                && let Some(wifi_ui) = &mut self.wifi
+            {
+                wifi_ui.selection = index;
+            }
+            let active = index == selection;
+            if active {
+                clipped.rect_filled(row, 8.0, tint(accent, 30));
+                clipped.rect_stroke(
+                    row,
+                    8.0,
+                    Stroke::new(1.0, tint(accent, 120)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            shadow_text(
+                &clipped,
+                Pos2::new(row.left() + 14.0, row.center().y),
+                Align2::LEFT_CENTER,
+                &truncate(&network.ssid, 28),
+                FontId::proportional(15.0),
+                if active {
+                    Color32::WHITE
+                } else {
+                    Color32::from_white_alpha(185)
+                },
+            );
+            let state = if network.connected {
+                "Connected"
+            } else if network.known {
+                "Saved"
+            } else if network.secured() {
+                "Secured"
+            } else {
+                "Open"
+            };
+            shadow_text(
+                &clipped,
+                Pos2::new(row.right() - 44.0, row.center().y),
+                Align2::RIGHT_CENTER,
+                state,
+                FontId::proportional(12.0),
+                if network.connected {
+                    tint(accent, 230)
+                } else {
+                    Color32::from_white_alpha(150)
+                },
+            );
+            draw_signal_bars(
+                &clipped,
+                Pos2::new(row.right() - 16.0, row.center().y),
+                network.bars,
+                Color32::from_white_alpha(if active { 235 } else { 175 }),
+            );
+        }
+        shadow_text(
+            painter,
+            Pos2::new(panel.left() + 22.0, panel.bottom() - footer_height / 2.0 - 2.0),
+            Align2::LEFT_CENTER,
+            &footer_line,
+            FontId::proportional(11.0),
+            Color32::from_white_alpha(135),
+        );
+
+        if let Some((ssid, typed)) = password_prompt {
+            let prompt = Rect::from_center_size(rect.center(), Vec2::new(460.0, 168.0));
+            painter.rect_filled(prompt, 12.0, Color32::from_black_alpha(232));
+            painter.rect_stroke(
+                prompt,
+                12.0,
+                Stroke::new(1.0, Color32::from_white_alpha(110)),
+                egui::StrokeKind::Inside,
+            );
+            shadow_text(
+                painter,
+                Pos2::new(prompt.center().x, prompt.top() + 34.0),
+                Align2::CENTER_CENTER,
+                &format!("Password for {}", truncate(&ssid, 26)),
+                FontId::proportional(17.0),
+                Color32::WHITE,
+            );
+            let field = Rect::from_center_size(
+                Pos2::new(prompt.center().x, prompt.center().y + 4.0),
+                Vec2::new(prompt.width() - 72.0, 38.0),
+            );
+            painter.rect_filled(field, 8.0, Color32::from_white_alpha(16));
+            painter.rect_stroke(
+                field,
+                8.0,
+                Stroke::new(1.0, tint(accent, 150)),
+                egui::StrokeKind::Inside,
+            );
+            let dots = "•".repeat(typed.min(28));
+            let caret = if (self.wave_time * 2.0) as i32 % 2 == 0 || self.settings.reduced_motion {
+                "|"
+            } else {
+                " "
+            };
+            shadow_text(
+                painter,
+                Pos2::new(field.left() + 14.0, field.center().y),
+                Align2::LEFT_CENTER,
+                &format!("{dots}{caret}"),
+                FontId::proportional(16.0),
+                Color32::WHITE,
+            );
+            shadow_text(
+                painter,
+                Pos2::new(prompt.center().x, prompt.bottom() - 26.0),
+                Align2::CENTER_CENTER,
+                "Type with the keyboard     × Connect     ○ Cancel",
+                FontId::proportional(12.0),
+                Color32::from_white_alpha(165),
+            );
+        }
+    }
+
     /// A soft-shadowed, rounded, aspect-correct preview of the selected
     /// item's artwork on the right side. Small sources (resolved theme icons)
     /// are skipped rather than blown up into pixel mush.
@@ -1136,7 +1598,15 @@ impl XmbApp {
     }
 
     fn draw_footer(&self, painter: &egui::Painter, rect: Rect) {
-        let text = if self.options_open || self.submenu.is_some() {
+        let text = if self
+            .wifi
+            .as_ref()
+            .is_some_and(|wifi_ui| wifi_ui.password_for.is_some())
+        {
+            "× Connect     ○ Cancel"
+        } else if self.wifi.is_some() {
+            "× Select     ○ Back     △ Rescan"
+        } else if self.options_open || self.submenu.is_some() {
             "× Select     ○ Back"
         } else {
             "× Enter     ○ Back     △ Options"
@@ -1787,6 +2257,26 @@ fn spawn_steam_art_fetch(state: &AppState, sender: Sender<(String, Option<PathBu
             }
         }
     });
+}
+
+fn draw_signal_bars(painter: &egui::Painter, anchor: Pos2, bars: u8, color: Color32) {
+    for bar in 0..4u8 {
+        let height = 4.0 + bar as f32 * 3.0;
+        let x = anchor.x - 12.0 + bar as f32 * 5.0;
+        let filled = bar < bars;
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(x, anchor.y + 6.0 - height),
+                Vec2::new(3.0, height),
+            ),
+            1.0,
+            if filled {
+                color
+            } else {
+                Color32::from_white_alpha(45)
+            },
+        );
+    }
 }
 
 fn draw_toast(painter: &egui::Painter, rect: Rect, message: &str) {

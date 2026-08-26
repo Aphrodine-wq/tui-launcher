@@ -23,25 +23,51 @@ pub fn discover_all(
 ) -> HashMap<Mode, Vec<LibraryItem>> {
     let mut modes = HashMap::new();
     modes.insert(Mode::Settings, setting_root_items());
-    // Steam and Steam-classified applications live in Game, not Extras.
-    let (steam_apps, applications): (Vec<_>, Vec<_>) = discover_applications()
-        .into_iter()
-        .partition(|item| item.id.contains("steam") || item.title.to_ascii_lowercase().contains("steam"));
-    modes.insert(Mode::Extras, applications);
+    let library = discover_games();
+    let library_ids: HashSet<u32> = library
+        .iter()
+        .filter_map(|item| match item.action {
+            Action::Steam(app_id) => Some(app_id),
+            _ => None,
+        })
+        .collect();
+    // Steam and Steam-classified applications live in Game (dropping the
+    // desktop shortcuts that duplicate installed library games), and
+    // music-classified applications live in Music.
+    let mut extras = Vec::new();
+    let mut steam_apps = Vec::new();
+    let mut music_apps = Vec::new();
+    for application in discover_applications() {
+        if application
+            .steam_shortcut
+            .is_some_and(|app_id| library_ids.contains(&app_id))
+        {
+            continue;
+        }
+        if application.steam {
+            if !steam_tool(&application.item.title, 0) {
+                steam_apps.push(application.item);
+            }
+        } else if application.music {
+            music_apps.push(application.item);
+        } else {
+            extras.push(application.item);
+        }
+    }
+    modes.insert(Mode::Extras, extras);
     modes.insert(
         Mode::Photo,
         discover_media(&settings.media_paths, MediaKind::Photo),
     );
-    modes.insert(
-        Mode::Music,
-        discover_media(&settings.media_paths, MediaKind::Music),
-    );
+    let mut music = music_apps;
+    music.extend(discover_media(&settings.media_paths, MediaKind::Music));
+    modes.insert(Mode::Music, music);
     modes.insert(
         Mode::Video,
         discover_media(&settings.media_paths, MediaKind::Video),
     );
     let mut games = steam_apps;
-    games.extend(discover_games());
+    games.extend(library);
     modes.insert(Mode::Game, games);
     modes.insert(Mode::Network, network_items());
     for (mode, items) in &mut modes {
@@ -82,7 +108,14 @@ pub fn settings_group_items(
     }
 }
 
-pub fn discover_applications() -> Vec<LibraryItem> {
+pub struct DiscoveredApp {
+    pub item: LibraryItem,
+    pub steam: bool,
+    pub steam_shortcut: Option<u32>,
+    pub music: bool,
+}
+
+pub fn discover_applications() -> Vec<DiscoveredApp> {
     let locales = get_languages_from_env();
     let desktops = current_desktop().unwrap_or_default();
     let mut seen = HashSet::new();
@@ -104,6 +137,16 @@ pub fn discover_applications() -> Vec<LibraryItem> {
             .map(|value| value.into_owned())
             .unwrap_or_else(|| "Desktop application".to_owned());
         let art = entry.icon().and_then(resolve_icon);
+        let exec = entry.exec().unwrap_or_default().to_owned();
+        let steam_shortcut = steam_shortcut_app_id(&exec);
+        let steam = steam_shortcut.is_some()
+            || entry.id().to_ascii_lowercase().contains("steam")
+            || name.to_ascii_lowercase().contains("steam")
+            || exec.to_ascii_lowercase().contains("steam");
+        let music = entry
+            .categories()
+            .unwrap_or_default()
+            .contains(&"Music");
         let mut item = LibraryItem::simple(
             format!("application:{}", entry.id().to_ascii_lowercase()),
             name,
@@ -112,11 +155,26 @@ pub fn discover_applications() -> Vec<LibraryItem> {
         item.subtitle = subtitle;
         item.details = vec![entry.id().to_owned(), path.display().to_string()];
         item.art = art;
-        applications.push(item);
+        applications.push(DiscoveredApp {
+            item,
+            steam,
+            steam_shortcut,
+            music,
+        });
     }
 
-    applications.sort_by(|left, right| natural_title_cmp(&left.title, &right.title));
+    applications.sort_by(|left, right| natural_title_cmp(&left.item.title, &right.item.title));
     applications
+}
+
+/// Steam-created game shortcuts run `steam steam://rungameid/<app id>`.
+pub fn steam_shortcut_app_id(exec: &str) -> Option<u32> {
+    let start = exec.find("steam://rungameid/")? + "steam://rungameid/".len();
+    let digits: String = exec[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 pub fn discover_games() -> Vec<LibraryItem> {
@@ -304,16 +362,25 @@ pub fn network_items() -> Vec<LibraryItem> {
     vec![browser]
 }
 
-fn network_settings_item() -> LibraryItem {
+fn wifi_item() -> LibraryItem {
     let status = system_status()
         .network
         .unwrap_or_else(|| "Offline".to_owned());
+    let mut wifi = LibraryItem::simple("network:wifi", "Wi-Fi Networks", Action::Wifi);
+    wifi.subtitle = status;
+    if !crate::wifi::available() {
+        wifi = wifi.unavailable("iwd (iwctl) was not found");
+    }
+    wifi
+}
+
+fn network_settings_item() -> LibraryItem {
     let mut connection = LibraryItem::simple(
         "network:connections",
-        "Network Settings",
+        "Advanced Network Settings",
         Action::Network(NetworkAction::OpenConnections),
     );
-    connection.subtitle = status;
+    connection.subtitle = "External network tool".to_owned();
     if !command_exists("nm-connection-editor") && !command_exists("gnome-control-center") {
         connection = connection.unavailable("no graphical network settings tool was found");
     }
@@ -434,7 +501,7 @@ fn volume_status() -> Option<String> {
 }
 
 pub fn system_control_items() -> Vec<LibraryItem> {
-    let mut items = vec![network_settings_item()];
+    let mut items = vec![wifi_item(), network_settings_item()];
     add_control(
         &mut items,
         "volume-down",
@@ -505,9 +572,6 @@ pub fn system_control_items() -> Vec<LibraryItem> {
 
 pub fn power_items() -> Vec<LibraryItem> {
     let mut items = Vec::new();
-    let mut close = LibraryItem::simple("system:exit", "Close overlay", Action::Exit);
-    close.subtitle = "Exit this launcher".to_owned();
-    items.push(close);
     add_control(
         &mut items,
         "lock",
@@ -553,6 +617,11 @@ pub fn power_items() -> Vec<LibraryItem> {
         command_exists("systemctl"),
         "systemctl is unavailable",
     );
+    // Last on purpose: an accidental double-confirm entering this group
+    // must not dismiss the launcher.
+    let mut close = LibraryItem::simple("system:exit", "Close overlay", Action::Exit);
+    close.subtitle = "Exit this launcher".to_owned();
+    items.push(close);
     items
 }
 
@@ -650,9 +719,15 @@ pub fn controller_items(settings: &Settings) -> Vec<LibraryItem> {
 
 pub fn order_library(items: &mut [LibraryItem], persisted: &PersistentState, mode: Mode) {
     items.sort_by(|left, right| {
-        // The Steam client is pinned to the top of Game, above favorites.
-        let left_pinned = left.id == "application:steam";
-        let right_pinned = right.id == "application:steam";
+        // The Steam client is pinned to the top of Game, and music
+        // applications to the top of Music, above favorites.
+        let pinned = |item: &LibraryItem| match mode {
+            Mode::Game => item.id == "application:steam",
+            Mode::Music => item.id.starts_with("application:"),
+            _ => false,
+        };
+        let left_pinned = pinned(left);
+        let right_pinned = pinned(right);
         let left_favorite = persisted.favorites.contains(&left.id);
         let right_favorite = persisted.favorites.contains(&right.id);
         let left_recent = persisted.recent_position(mode, &left.id);
@@ -943,12 +1018,25 @@ mod tests {
         let power = settings_group_items(SettingsGroup::Power, &settings);
         assert!(power.iter().any(|item| item.id == "system:shutdown"));
         assert!(!power.iter().any(|item| item.id == "system:volume-up"));
-        assert_eq!(power.first().map(|item| item.id.as_str()), Some("system:exit"));
+        assert_eq!(power.last().map(|item| item.id.as_str()), Some("system:exit"));
         let system = settings_group_items(SettingsGroup::System, &settings);
         assert_eq!(
             system.first().map(|item| item.id.as_str()),
+            Some("network:wifi")
+        );
+        assert_eq!(
+            system.get(1).map(|item| item.id.as_str()),
             Some("network:connections")
         );
+    }
+
+    #[test]
+    fn steam_shortcut_app_ids_parse_from_exec() {
+        assert_eq!(
+            steam_shortcut_app_id("steam steam://rungameid/377160"),
+            Some(377160)
+        );
+        assert_eq!(steam_shortcut_app_id("/usr/bin/spotify %U"), None);
     }
 
     #[test]

@@ -6,9 +6,10 @@ The category order follows the PSP home menu:
 
 **Settings → Extras → Photo → Music → Video → Game → Network**
 
-- **Settings** renders as a menu panel with Appearance, Controller, System, and Power groups; confirming a group opens it in place and Back returns. Network configuration lives under System.
-- **Extras** discovers visible freedesktop desktop applications and resolves their native icons. Steam-classified entries are shown under Game instead.
-- **Photo**, **Music**, and **Video** read the configured media folders. Video thumbnails are generated asynchronously.
+- **Settings** renders as a menu panel with Appearance, Controller, System, and Power groups; confirming a group opens it in place and Back returns.
+- **Settings → System → Wi-Fi Networks** is a native Wi-Fi manager built on iwd (`iwctl`): scan, signal bars, connect to open or saved networks, disconnect, and a password prompt for new secured networks (typed with the keyboard). An external tool remains available as Advanced Network Settings.
+- **Extras** discovers visible freedesktop desktop applications and resolves their native icons. Steam-classified entries are shown under Game, and music-classified applications under Music; Steam-created game shortcuts that duplicate installed library games are dropped.
+- **Photo**, **Music**, and **Video** read the configured media folders. Music lists music applications (such as Spotify) first, then local tracks. Video thumbnails are generated asynchronously.
 - **Game** pins the Steam client first, then installed Steam games with local artwork; runtime tools and dedicated servers are filtered out.
 - **Network** opens the default browser and shows the connection state.
 

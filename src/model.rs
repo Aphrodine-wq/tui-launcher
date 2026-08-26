@@ -93,6 +93,7 @@ pub enum Action {
     System(SystemAction),
     Setting(SettingAction),
     Group(SettingsGroup),
+    Wifi,
     Exit,
 }
 

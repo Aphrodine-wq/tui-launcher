@@ -5,6 +5,7 @@ mod input;
 mod model;
 mod platform;
 mod sources;
+mod wifi;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -60,8 +61,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.list {
         for application in sources::discover_applications() {
-            if let model::Action::Desktop(path) = application.action {
-                println!("{}\t{}", application.title, path.display());
+            if let model::Action::Desktop(path) = application.item.action {
+                println!("{}\t{}", application.item.title, path.display());
             }
         }
         return Ok(());
