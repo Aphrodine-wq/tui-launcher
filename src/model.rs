@@ -140,6 +140,7 @@ pub enum SettingAction {
     NetworkArtwork,
     Background,
     BackgroundMode,
+    WallpaperScene,
     ThemePack,
     Sparkles,
     BootAnimation,

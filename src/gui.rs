@@ -138,6 +138,10 @@ impl XmbApp {
             spawn_steam_art_fetch(&state, art_tx.clone());
         }
         let pack = settings.theme_pack.as_deref().and_then(theme::load);
+        if settings.background_mode == "wallpaper" {
+            // Self-heal: see-through mode is black if the wallpaper died.
+            sources::ensure_wallpaper();
+        }
         let audio = AudioFeedback::new();
         if settings.sound
             && settings.boot_animation
@@ -693,6 +697,30 @@ impl XmbApp {
                 self.sysinfo_open = Some(sysinfo::gather());
                 self.feedback(Tone::Confirm);
             }
+            Action::Setting(SettingAction::WallpaperScene) => {
+                // Not a launcher setting: drives the termpaper wallpaper group.
+                let scenes = sources::termpaper_scenes();
+                if scenes.is_empty() {
+                    self.toast("termpaper is not available");
+                    self.feedback(Tone::Warning);
+                    return;
+                }
+                let next = match sources::termpaper_scene()
+                    .and_then(|current| scenes.iter().position(|scene| *scene == current))
+                {
+                    Some(index) => scenes[(index + 1) % scenes.len()].clone(),
+                    None => scenes[0].clone(),
+                };
+                if sources::termpaper_switch(&next) {
+                    sources::ensure_wallpaper();
+                    self.refresh_settings_items();
+                    self.toast(format!("Wallpaper scene: {next}"));
+                    self.feedback(Tone::Confirm);
+                } else {
+                    self.toast("Could not switch the wallpaper scene");
+                    self.feedback(Tone::Warning);
+                }
+            }
             Action::Setting(setting) => {
                 let setting = *setting;
                 let had_background = self.settings.background_image.is_some();
@@ -722,6 +750,9 @@ impl XmbApp {
                         self.toast(format!("Theme: {name}"));
                     }
                     SettingAction::BackgroundMode => {
+                        if self.settings.background_mode == "wallpaper" {
+                            sources::ensure_wallpaper();
+                        }
                         let hint = match self.settings.background_mode.as_str() {
                             "picture"
                                 if self.settings.background_image.is_none()
@@ -956,7 +987,7 @@ impl XmbApp {
             painter.add(egui::epaint::RectShape::filled(
                 rect.shrink(1.0),
                 egui::CornerRadius::same(26),
-                Color32::from_black_alpha(64),
+                Color32::from_black_alpha(46),
             ));
             paint_background(painter, rect, self.wave_time, &self.settings, true, accent, None);
             return;
@@ -2551,6 +2582,7 @@ fn adjust_setting(action: SettingAction, settings: &mut Settings) {
                     .cloned(),
             };
         }
+        SettingAction::WallpaperScene => {}
         SettingAction::Sparkles => settings.sparkles = !settings.sparkles,
         SettingAction::SoundVolume => {
             let step = ((settings.sound_volume * 4.0).round() as u32 + 1) % 5;

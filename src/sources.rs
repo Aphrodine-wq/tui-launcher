@@ -720,6 +720,12 @@ pub fn setting_items(settings: &Settings) -> Vec<LibraryItem> {
             SettingAction::BackgroundMode,
         ),
         (
+            "wallpaper-scene",
+            "Wallpaper scene",
+            termpaper_scene().unwrap_or_else(|| "—".to_owned()),
+            SettingAction::WallpaperScene,
+        ),
+        (
             "background",
             "Background picture",
             settings
@@ -791,6 +797,9 @@ pub fn setting_items(settings: &Settings) -> Vec<LibraryItem> {
             let mut item =
                 LibraryItem::simple(format!("setting:{id}"), title, Action::Setting(action));
             item.subtitle = subtitle;
+            if action == SettingAction::WallpaperScene && !termpaper_available() {
+                item = item.unavailable("termpaper is not installed");
+            }
             item
         })
         .collect()
@@ -895,6 +904,114 @@ fn resolve_icon(icon: &str) -> Option<PathBuf> {
         .with_size(128)
         .with_cache()
         .find()
+}
+
+/// Make sure the termpaper wallpaper instances exist for see-through mode.
+/// The wallpaper script is idempotent, so this only spawns what's missing.
+pub fn ensure_wallpaper() {
+    std::thread::spawn(|| {
+        let Ok(output) = Command::new("hyprctl").args(["clients", "-j"]).output() else {
+            return;
+        };
+        let clients = String::from_utf8_lossy(&output.stdout);
+        if clients.contains("termpaper-wallpaper-0") && clients.contains("termpaper-wallpaper-1") {
+            return;
+        }
+        let Some(home) = env::var_os("HOME") else {
+            return;
+        };
+        let script = PathBuf::from(home).join(".local/bin/termpaper-wallpaper.sh");
+        if script.is_file() {
+            let _ = Command::new(script)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    });
+}
+
+pub fn termpaper_available() -> bool {
+    command_exists("termpaper")
+}
+
+/// Scene catalog from `termpaper --list` ("name  description" per line).
+pub fn termpaper_scenes() -> Vec<String> {
+    let Ok(output) = Command::new("termpaper").arg("--list").output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_scene_list(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_scene_list(raw: &str) -> Vec<String> {
+    raw.lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The scene currently on the wallpaper group: the live switch channel if
+/// one exists, else the termpaper config default.
+pub fn termpaper_scene() -> Option<String> {
+    if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") {
+        let control = PathBuf::from(runtime).join("termpaper/groups/wallpaper/control.json");
+        if let Ok(contents) = fs::read_to_string(control)
+            && let Some(scene) = json_str_field(&contents, "scene")
+        {
+            return Some(scene);
+        }
+    }
+    let base = directories::BaseDirs::new()?;
+    let contents = fs::read_to_string(base.config_dir().join("termpaper/config.toml")).ok()?;
+    toml::from_str::<toml::Table>(&contents)
+        .ok()?
+        .get("scene")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Switch the wallpaper group's scene and persist it as termpaper's
+/// default so a wallpaper restart keeps it.
+pub fn termpaper_switch(scene: &str) -> bool {
+    let ok = Command::new("termpaper")
+        .args(["--switch", scene, "--group", "wallpaper"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !ok {
+        return false;
+    }
+    if let Some(base) = directories::BaseDirs::new() {
+        let path = base.config_dir().join("termpaper/config.toml");
+        if let Ok(contents) = fs::read_to_string(&path)
+            && let Ok(mut table) = toml::from_str::<toml::Table>(&contents)
+        {
+            table.insert("scene".to_owned(), toml::Value::String(scene.to_owned()));
+            if let Ok(serialized) = toml::to_string_pretty(&table) {
+                let _ = fs::write(&path, serialized);
+            }
+        }
+    }
+    true
+}
+
+/// Extract "key":"value" from compact JSON without a JSON dependency.
+fn json_str_field(raw: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\":\"");
+    let start = raw.find(&pattern)? + pattern.len();
+    let rest = &raw[start..];
+    Some(rest[..rest.find('"')?].to_owned())
 }
 
 pub fn steam_cover_cache_path(app_id: u32) -> Option<PathBuf> {
@@ -1169,6 +1286,20 @@ mod tests {
             .find(|item| item.id == "setting:background")
             .unwrap();
         assert_eq!(background.subtitle, "sunset.jpg");
+    }
+
+    #[test]
+    fn termpaper_parsers_handle_real_shapes() {
+        let scenes = parse_scene_list("rain          falling rain\nstarfield     drifting stars\npulse         community scene [community]\n");
+        assert_eq!(scenes, ["rain", "starfield", "pulse"]);
+        assert_eq!(
+            json_str_field(
+                "{\"kind\":\"scene\",\"scene\":\"starfield\",\"theme\":null,\"seq\":13}",
+                "scene"
+            ),
+            Some("starfield".to_owned())
+        );
+        assert_eq!(json_str_field("{}", "scene"), None);
     }
 
     #[test]
