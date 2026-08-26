@@ -258,7 +258,7 @@ impl XmbApp {
             return;
         }
         if self.submenu.is_some() {
-            self.handle_submenu_action(action);
+            self.handle_submenu_action(action, ctx);
             return;
         }
         match action {
@@ -279,14 +279,10 @@ impl XmbApp {
                 }
             }
             InputAction::Favorite => self.toggle_favorite(),
-            InputAction::Back => {
-                if self.options_open {
-                    self.options_open = false;
-                    self.feedback(Tone::Back);
-                } else {
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                }
-            }
+            // Back at the root deliberately does nothing: closing the whole
+            // overlay is a Settings → Power → Close overlay action, so a
+            // stray ○ press can't dismiss the launcher.
+            InputAction::Back => {}
             InputAction::Confirm => self.confirm(ctx),
         }
     }
@@ -373,7 +369,7 @@ impl XmbApp {
         self.feedback(Tone::Navigate);
     }
 
-    fn handle_submenu_action(&mut self, action: InputAction) {
+    fn handle_submenu_action(&mut self, action: InputAction, ctx: &egui::Context) {
         match action {
             InputAction::PreviousItem | InputAction::NextItem => {
                 let Some(submenu) = &mut self.submenu else {
@@ -397,7 +393,7 @@ impl XmbApp {
                 self.submenu = None;
                 self.feedback(Tone::Back);
             }
-            InputAction::Confirm => self.confirm_submenu_item(),
+            InputAction::Confirm => self.confirm_submenu_item(ctx),
             InputAction::Context | InputAction::Favorite => {}
         }
     }
@@ -413,7 +409,7 @@ impl XmbApp {
         self.feedback(Tone::Confirm);
     }
 
-    fn confirm_submenu_item(&mut self) {
+    fn confirm_submenu_item(&mut self, ctx: &egui::Context) {
         let Some(item) = self
             .submenu
             .as_ref()
@@ -431,6 +427,10 @@ impl XmbApp {
             return;
         }
         match &item.action {
+            Action::Exit => {
+                self.feedback(Tone::Back);
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
             Action::Setting(setting) => {
                 let setting = *setting;
                 let had_background = self.settings.background_image.is_some();
@@ -479,6 +479,11 @@ impl XmbApp {
         }
         if let Action::Group(group) = item.action {
             self.open_submenu(group);
+            return;
+        }
+        if item.action == Action::Exit {
+            self.feedback(Tone::Back);
+            ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
         if let Action::Setting(action) = item.action {

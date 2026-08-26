@@ -35,12 +35,14 @@ Controller rumble is not used.
 | Change category | Left / Right | D-pad or left stick |
 | Change item | Up / Down | D-pad or left stick |
 | Confirm | Enter / Space | South button |
-| Back / close | Escape | East button |
+| Back | Escape | East button |
 | Options menu | T | North button |
 | Favorite | F | West button |
 | Jump to Settings | S | Start / Menu |
 
 The on-screen prompts intentionally use the PSP-style ×, ○, and △ symbols while input remains mapped to the connected controller.
+
+Back only steps out of panels and sub-lists; at the top level it does nothing, so a stray press cannot dismiss the launcher. The overlay is closed deliberately through **Settings → Power → Close overlay** (or the window manager).
 
 ## Commands
 

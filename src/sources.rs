@@ -490,6 +490,9 @@ pub fn system_control_items() -> Vec<LibraryItem> {
 
 pub fn power_items() -> Vec<LibraryItem> {
     let mut items = Vec::new();
+    let mut close = LibraryItem::simple("system:exit", "Close overlay", Action::Exit);
+    close.subtitle = "Exit this launcher".to_owned();
+    items.push(close);
     add_control(
         &mut items,
         "lock",
@@ -921,6 +924,7 @@ mod tests {
         let power = settings_group_items(SettingsGroup::Power, &settings);
         assert!(power.iter().any(|item| item.id == "system:shutdown"));
         assert!(!power.iter().any(|item| item.id == "system:volume-up"));
+        assert_eq!(power.first().map(|item| item.id.as_str()), Some("system:exit"));
     }
 
     #[test]
