@@ -14,9 +14,11 @@ The category order follows the PSP home menu:
 
 ## Interface
 
-The native overlay opens as a centered, borderless 16:9 window. Categories move horizontally while the selected category remains at the visual anchor; its content forms the vertical part of the XMB. Selection motion and the background waves are time-based and independent of frame rate.
+The native overlay opens as a centered, borderless 16:9 window. Categories move horizontally while the selected category remains at the visual anchor; its content forms the vertical part of the XMB, and items above the selection jump over the category crossbar the way the original interface does. Category icons are original vector drawings rendered at any size. Selection motion and the background are time-based and independent of frame rate.
 
-The default background color follows the current month. Themes offset that monthly palette, and reduced-motion mode disables animated transitions.
+The background is a monthly gradient crossed by filled, glowing wave ribbons with drifting sparkles. The wave accent setting tints the ribbons, sparkles, and boot wordmark (Classic, Aqua, Amber, Rose, Emerald). The transparent-overlay setting switches between a translucent and a fully opaque background. Reduced-motion mode freezes the waves, disables animated transitions, and skips the short boot-in animation.
+
+When "Fetch missing Steam artwork" is enabled, boxart for installed Steam games that have no local artwork is downloaded once from Steam's public CDN and cached under `${XDG_CACHE_HOME:-~/.cache}/tui-launcher/steam-art/`. This is the only network access in the application and it stays off by default.
 
 Launching an application, game, photo, video, or network tool hides the overlay. On Hyprland, the launcher watches for the new window and restores the overlay to the same category and item after that window closes.
 

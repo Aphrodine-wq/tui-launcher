@@ -11,6 +11,7 @@ pub enum Tone {
     Confirm,
     Back,
     Warning,
+    Boot,
 }
 
 pub struct AudioFeedback {
@@ -29,17 +30,20 @@ impl AudioFeedback {
     }
 
     pub fn play(&self, tone: Tone, volume: f32) {
-        let (frequency, duration) = match tone {
-            Tone::Navigate => (520.0, 34),
-            Tone::Confirm => (740.0, 72),
-            Tone::Back => (360.0, 62),
-            Tone::Warning => (190.0, 130),
+        let notes: &[(f32, u64)] = match tone {
+            Tone::Navigate => &[(520.0, 34)],
+            Tone::Confirm => &[(740.0, 72)],
+            Tone::Back => &[(360.0, 62)],
+            Tone::Warning => &[(190.0, 130)],
+            Tone::Boot => &[(523.25, 120), (784.0, 300)],
         };
-        self.player.append(
-            SineWave::new(frequency)
-                .take_duration(Duration::from_millis(duration))
-                .fade_out(Duration::from_millis(duration / 2))
-                .amplify(volume.clamp(0.0, 1.0)),
-        );
+        for &(frequency, duration) in notes {
+            self.player.append(
+                SineWave::new(frequency)
+                    .take_duration(Duration::from_millis(duration))
+                    .fade_out(Duration::from_millis(duration / 2))
+                    .amplify(volume.clamp(0.0, 1.0)),
+            );
+        }
     }
 }

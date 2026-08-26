@@ -38,22 +38,12 @@ impl Mode {
         }
     }
 
-    pub fn glyph(self) -> &'static str {
-        match self {
-            Self::Settings => "⚙",
-            Self::Extras => "✦",
-            Self::Photo => "▧",
-            Self::Music => "♪",
-            Self::Video => "▶",
-            Self::Game => "◆",
-            Self::Network => "◎",
-        }
-    }
-
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0)
     }
 }
+
+pub const ACCENT_NAMES: [&str; 5] = ["Classic", "Aqua", "Amber", "Rose", "Emerald"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MediaControl {
@@ -113,7 +103,6 @@ pub enum SettingAction {
     Sound,
     ReducedMotion,
     NetworkArtwork,
-    PanelWidth,
     ResetAppearance,
     Binding(BindingTarget),
 }

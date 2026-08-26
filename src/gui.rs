@@ -44,6 +44,7 @@ pub struct XmbApp {
     options_selection: usize,
     information_open: bool,
     pending_destructive: Option<Action>,
+    boot_at: Instant,
     toast: Option<(String, Instant)>,
     last_status_refresh: Instant,
     last_media_refresh: Instant,
@@ -79,6 +80,15 @@ impl XmbApp {
             .collect();
         let (message_tx, message_rx) = mpsc::channel();
         let (art_tx, art_rx) = mpsc::channel();
+        if settings.network_artwork {
+            spawn_steam_art_fetch(&state, art_tx.clone());
+        }
+        let audio = AudioFeedback::new();
+        if settings.sound
+            && let Some(audio) = &audio
+        {
+            audio.play(Tone::Boot, settings.sound_volume);
+        }
         Self {
             settings,
             migrated,
@@ -87,7 +97,7 @@ impl XmbApp {
             item_positions,
             state,
             controller,
-            audio: AudioFeedback::new(),
+            audio,
             wave_time: 0.0,
             textures: HashMap::new(),
             generated_art: HashMap::new(),
@@ -98,6 +108,7 @@ impl XmbApp {
             options_selection: 0,
             information_open: false,
             pending_destructive: None,
+            boot_at: Instant::now(),
             toast: None,
             last_status_refresh: Instant::now(),
             last_media_refresh: Instant::now(),
@@ -108,7 +119,9 @@ impl XmbApp {
 
     fn update_runtime(&mut self, ctx: &egui::Context) {
         let dt = ctx.input(|input| input.stable_dt).clamp(0.0, 0.05);
-        self.wave_time += dt;
+        if !self.settings.reduced_motion {
+            self.wave_time += dt;
+        }
         let category_target = self.state.mode.index() as f32;
         if self.settings.reduced_motion {
             self.category_position = category_target;
@@ -433,6 +446,11 @@ impl XmbApp {
         if let Some((message, _)) = &self.toast {
             draw_toast(&painter, rect, message);
         }
+        if !self.settings.reduced_motion
+            && let Some((veil, wordmark)) = boot_phase(self.boot_at.elapsed().as_secs_f32())
+        {
+            draw_boot(&painter, rect, veil, wordmark, self.settings.accent);
+        }
     }
 
     fn draw_status(&self, painter: &egui::Painter, rect: Rect) {
@@ -461,7 +479,7 @@ impl XmbApp {
         if let Some(battery) = &self.state.system_status.battery {
             pieces.push(battery.clone());
         }
-        pieces.push(Local::now().format("%-I:%M %p").to_string());
+        pieces.push(Local::now().format("%-m/%-d %-I:%M %p").to_string());
         shadow_text(
             painter,
             Pos2::new(rect.right() - 42.0, top),
@@ -473,7 +491,12 @@ impl XmbApp {
     }
 
     fn draw_categories(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect) {
-        let center = Pos2::new(rect.center().x, rect.top() + rect.height() * 0.30);
+        // The active category sits on the same vertical spine the item column
+        // descends from, left of center like the original crossbar.
+        let center = Pos2::new(
+            rect.center().x - rect.width() * 0.08,
+            rect.top() + rect.height() * 0.30,
+        );
         let spacing = (rect.width() * 0.105).clamp(82.0, 132.0);
         for (index, mode) in Mode::ALL.into_iter().enumerate() {
             let offset = index as f32 - self.category_position;
@@ -492,12 +515,11 @@ impl XmbApp {
                 self.state.mode = mode;
                 self.options_open = false;
             }
-            shadow_text(
+            shadow_icon(
                 painter,
+                mode,
                 Pos2::new(x, center.y),
-                Align2::CENTER_CENTER,
-                mode.glyph(),
-                FontId::proportional(size),
+                size,
                 Color32::from_white_alpha(alpha),
             );
             if mode == self.state.mode {
@@ -556,12 +578,18 @@ impl XmbApp {
             );
         }
 
+        // Items above the selection jump over the category crossbar, like the
+        // original XMB; the ramp keeps scrolling continuous.
+        let category_y = rect.top() + rect.height() * 0.30;
+        let crossbar_gap = (anchor.y - category_y) - row_height * 0.25;
         for (index, item) in items.iter().enumerate() {
             let delta = index as f32 - visual;
             if delta.abs() > 4.3 {
                 continue;
             }
-            let y = anchor.y + delta * row_height;
+            let ramp = (-delta).clamp(0.0, 1.0);
+            let ramp = ramp * ramp * (3.0 - 2.0 * ramp);
+            let y = anchor.y + delta * row_height - ramp * crossbar_gap;
             let active = index == selected;
             let opacity = ((1.0 - (delta.abs() / 5.0)) * 255.0).clamp(55.0, 255.0) as u8;
             let icon_size = if active { 39.0 } else { 28.0 };
@@ -596,19 +624,12 @@ impl XmbApp {
                     Color32::from_white_alpha(opacity),
                 );
             } else {
-                let icon = if active { mode.glyph() } else { "•" };
-                shadow_text(
-                    painter,
-                    Pos2::new(anchor.x, y),
-                    Align2::CENTER_CENTER,
-                    icon,
-                    FontId::proportional(icon_size),
-                    if item.available {
-                        Color32::from_white_alpha(opacity)
-                    } else {
-                        Color32::from_gray(105)
-                    },
-                );
+                let color = if item.available {
+                    Color32::from_white_alpha(opacity)
+                } else {
+                    Color32::from_gray(105)
+                };
+                shadow_icon(painter, mode, Pos2::new(anchor.x, y), icon_size, color);
             }
             if active {
                 shadow_text(
@@ -974,7 +995,11 @@ fn video_thumbnail(path: &Path) -> Option<PathBuf> {
 }
 
 fn paint_background(painter: &egui::Painter, rect: Rect, time: f32, settings: &Settings) {
-    let [top, bottom] = monthly_palette(Local::now().month0() as usize, settings.theme);
+    let [top, bottom] = monthly_palette(
+        Local::now().month0() as usize,
+        settings.theme,
+        settings.transparent,
+    );
     let mut mesh = Mesh::default();
     let inset = rect.shrink(1.0);
     mesh.colored_vertex(inset.left_top(), top);
@@ -991,29 +1016,90 @@ fn paint_background(painter: &egui::Painter, rect: Rect, time: f32, settings: &S
         egui::StrokeKind::Inside,
     );
     if settings.waves {
-        for lane in 0..3 {
-            let mut points = Vec::with_capacity(121);
-            for step in 0..=120 {
-                let unit = step as f32 / 120.0;
-                let x = rect.left() + unit * rect.width();
-                let base = rect.top() + rect.height() * (0.68 + lane as f32 * 0.065);
-                let y = base
-                    + (unit * std::f32::consts::TAU * (1.25 + lane as f32 * 0.18)
-                        + time * (0.32 + lane as f32 * 0.08))
-                        .sin()
-                        * rect.height()
-                        * (0.035 + lane as f32 * 0.008);
-                points.push(Pos2::new(x, y));
-            }
+        let accent = accent_color(settings.accent);
+        paint_wave_ribbons(painter, rect, time, accent);
+        paint_sparkles(painter, rect, time, accent);
+    }
+}
+
+/// The signature XMB element: filled translucent ribbons whose bright crest
+/// fades into the background, drawn as vertical gradient strips under a
+/// two-harmonic crest line with a layered glow.
+fn paint_wave_ribbons(painter: &egui::Painter, rect: Rect, time: f32, accent: Color32) {
+    const STEPS: usize = 96;
+    let lanes = [
+        // (vertical anchor, amplitude, cycles, speed, crest alpha, fill alpha)
+        (0.70_f32, 0.052_f32, 1.15_f32, 0.26_f32, 60_u8, 26_u8),
+        (0.78, 0.040, 1.55, 0.38, 44, 18),
+    ];
+    for (anchor, amplitude, cycles, speed, crest_alpha, fill_alpha) in lanes {
+        let crest = |unit: f32| -> f32 {
+            let phase = unit * std::f32::consts::TAU * cycles + time * speed;
+            let swell = phase.sin();
+            let ripple = (phase * 2.7 + time * 0.11).sin() * 0.28;
+            rect.top() + rect.height() * anchor + (swell + ripple) * rect.height() * amplitude
+        };
+        let mut mesh = Mesh::default();
+        let mut crest_points = Vec::with_capacity(STEPS + 1);
+        for step in 0..=STEPS {
+            let unit = step as f32 / STEPS as f32;
+            let x = rect.left() + unit * rect.width();
+            let y = crest(unit);
+            crest_points.push(Pos2::new(x, y));
+            mesh.colored_vertex(Pos2::new(x, y), tint(accent, fill_alpha));
+            mesh.colored_vertex(Pos2::new(x, rect.bottom()), Color32::TRANSPARENT);
+        }
+        for step in 0..STEPS as u32 {
+            let base = step * 2;
+            mesh.add_triangle(base, base + 1, base + 2);
+            mesh.add_triangle(base + 1, base + 3, base + 2);
+        }
+        painter.add(Shape::mesh(mesh));
+        for (width, alpha) in [(4.6, crest_alpha / 4), (2.2, crest_alpha / 2), (1.1, crest_alpha)] {
             painter.add(Shape::line(
-                points,
-                Stroke::new(1.1, Color32::from_white_alpha(42 - lane as u8 * 7)),
+                crest_points.clone(),
+                Stroke::new(width, tint(accent, alpha)),
             ));
         }
     }
 }
 
-fn monthly_palette(month: usize, theme: usize) -> [Color32; 2] {
+/// Small lights drifting along the wave band, each fully determined by its
+/// index and the shared clock so the field stays stable frame to frame.
+fn paint_sparkles(painter: &egui::Painter, rect: Rect, time: f32, accent: Color32) {
+    const COUNT: usize = 26;
+    for index in 0..COUNT {
+        let seed = index as f32 * 2.399963;
+        let hash = (seed.sin() * 43758.547).fract().abs();
+        let drift = 0.010 + hash * 0.022;
+        let unit = (seed * 0.618 + time * drift).fract();
+        let x = rect.left() + unit * rect.width();
+        let band = 0.66 + (seed * 1.7).sin().abs() * 0.20;
+        let bob = ((time * (0.5 + hash * 0.7)) + seed * 7.0).sin() * rect.height() * 0.035;
+        let y = rect.top() + rect.height() * band + bob;
+        let pulse = ((time * (1.1 + hash * 1.4) + seed * 3.0).sin() * 0.5 + 0.5).powi(2);
+        let alpha = (30.0 + pulse * 150.0) as u8;
+        let radius = 0.9 + hash * 1.6 + pulse * 0.7;
+        painter.circle_filled(Pos2::new(x, y), radius + 1.6, tint(accent, alpha / 5));
+        painter.circle_filled(Pos2::new(x, y), radius, tint(accent, alpha));
+    }
+}
+
+fn tint(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+fn accent_color(accent: usize) -> Color32 {
+    match accent {
+        1 => Color32::from_rgb(150, 226, 255),
+        2 => Color32::from_rgb(255, 214, 140),
+        3 => Color32::from_rgb(255, 164, 196),
+        4 => Color32::from_rgb(158, 240, 186),
+        _ => Color32::from_rgb(235, 240, 248),
+    }
+}
+
+fn monthly_palette(month: usize, theme: usize, transparent: bool) -> [Color32; 2] {
     const COLORS: [[(u8, u8, u8); 2]; 12] = [
         [(55, 102, 154), (17, 42, 78)],
         [(99, 74, 148), (35, 24, 75)],
@@ -1029,10 +1115,149 @@ fn monthly_palette(month: usize, theme: usize) -> [Color32; 2] {
         [(69, 121, 142), (20, 55, 73)],
     ];
     let colors = COLORS[(month + theme) % COLORS.len()];
+    let [top_alpha, bottom_alpha] = if transparent { [238, 246] } else { [255, 255] };
     [
-        Color32::from_rgba_premultiplied(colors[0].0, colors[0].1, colors[0].2, 238),
-        Color32::from_rgba_premultiplied(colors[1].0, colors[1].1, colors[1].2, 246),
+        Color32::from_rgba_premultiplied(colors[0].0, colors[0].1, colors[0].2, top_alpha),
+        Color32::from_rgba_premultiplied(colors[1].0, colors[1].1, colors[1].2, bottom_alpha),
     ]
+}
+
+/// Original vector icons for the seven categories, drawn at any size from
+/// strokes and fills so they stay crisp and carry the wave accent tint.
+fn shadow_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: f32, color: Color32) {
+    let shadow = Color32::from_black_alpha(color.a().saturating_sub(60));
+    paint_category_icon(painter, mode, center + Vec2::new(1.2, 1.5), size, shadow);
+    paint_category_icon(painter, mode, center, size, color);
+}
+
+fn paint_category_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: f32, color: Color32) {
+    let unit = size / 2.0;
+    let stroke = Stroke::new((size * 0.075).max(1.4), color);
+    match mode {
+        Mode::Settings => {
+            // Gear: ring, radial teeth, hub.
+            let radius = unit * 0.62;
+            painter.circle_stroke(center, radius, stroke);
+            painter.circle_filled(center, unit * 0.2, color);
+            for tooth in 0..8 {
+                let angle = tooth as f32 / 8.0 * std::f32::consts::TAU;
+                let direction = Vec2::angled(angle);
+                painter.line_segment(
+                    [
+                        center + direction * (radius + stroke.width * 0.4),
+                        center + direction * unit * 0.95,
+                    ],
+                    stroke,
+                );
+            }
+        }
+        Mode::Extras => {
+            // Application drawer: 2×2 rounded tiles.
+            let tile = unit * 0.72;
+            let gap = unit * 0.18;
+            for (dx, dy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let tile_center = center + Vec2::new(dx, dy) * (tile + gap) / 2.0;
+                painter.rect_stroke(
+                    Rect::from_center_size(tile_center, Vec2::splat(tile)),
+                    tile * 0.22,
+                    stroke,
+                    egui::StrokeKind::Middle,
+                );
+            }
+        }
+        Mode::Photo => {
+            // Framed landscape: border, sun, two peaks.
+            let frame = Rect::from_center_size(center, Vec2::new(size * 0.98, size * 0.78));
+            painter.rect_stroke(frame, size * 0.08, stroke, egui::StrokeKind::Middle);
+            painter.circle_filled(
+                frame.min + Vec2::new(frame.width() * 0.28, frame.height() * 0.3),
+                size * 0.09,
+                color,
+            );
+            let floor = frame.bottom() - stroke.width;
+            let points = vec![
+                Pos2::new(frame.left() + frame.width() * 0.1, floor),
+                Pos2::new(frame.left() + frame.width() * 0.38, floor - frame.height() * 0.42),
+                Pos2::new(frame.left() + frame.width() * 0.58, floor - frame.height() * 0.14),
+                Pos2::new(frame.left() + frame.width() * 0.74, floor - frame.height() * 0.34),
+                Pos2::new(frame.right() - frame.width() * 0.08, floor),
+            ];
+            painter.add(Shape::line(points, stroke));
+        }
+        Mode::Music => {
+            // Eighth note: head, stem, swept flag.
+            let head = center + Vec2::new(-unit * 0.3, unit * 0.55);
+            painter.circle_filled(head, unit * 0.3, color);
+            let stem_top = head + Vec2::new(unit * 0.28, -unit * 1.35);
+            painter.line_segment([head + Vec2::new(unit * 0.28, 0.0), stem_top], stroke);
+            let flag = vec![
+                stem_top,
+                stem_top + Vec2::new(unit * 0.5, unit * 0.22),
+                stem_top + Vec2::new(unit * 0.62, unit * 0.68),
+            ];
+            painter.add(Shape::line(flag, Stroke::new(stroke.width * 1.15, color)));
+        }
+        Mode::Video => {
+            // Filmstrip: frame with sprocket bands.
+            let frame = Rect::from_center_size(center, Vec2::new(size * 0.98, size * 0.74));
+            painter.rect_stroke(frame, size * 0.06, stroke, egui::StrokeKind::Middle);
+            for row in 0..3 {
+                let y = frame.top() + frame.height() * (0.22 + row as f32 * 0.28);
+                for edge in [frame.left() + frame.width() * 0.12, frame.right() - frame.width() * 0.12]
+                {
+                    painter.rect_filled(
+                        Rect::from_center_size(Pos2::new(edge, y), Vec2::splat(size * 0.085)),
+                        1.0,
+                        color,
+                    );
+                }
+            }
+            let play = vec![
+                center + Vec2::new(-unit * 0.16, -unit * 0.26),
+                center + Vec2::new(unit * 0.28, 0.0),
+                center + Vec2::new(-unit * 0.16, unit * 0.26),
+            ];
+            painter.add(Shape::convex_polygon(play, color, Stroke::NONE));
+        }
+        Mode::Game => {
+            // Gamepad: body, directional cross, action dots.
+            let body = Rect::from_center_size(center, Vec2::new(size * 1.02, size * 0.56));
+            painter.rect_stroke(body, body.height() * 0.45, stroke, egui::StrokeKind::Middle);
+            let pad = center + Vec2::new(-unit * 0.48, 0.0);
+            let arm = unit * 0.24;
+            painter.line_segment([pad - Vec2::new(arm, 0.0), pad + Vec2::new(arm, 0.0)], stroke);
+            painter.line_segment([pad - Vec2::new(0.0, arm), pad + Vec2::new(0.0, arm)], stroke);
+            let buttons = center + Vec2::new(unit * 0.48, 0.0);
+            for direction in [
+                Vec2::new(0.0, -1.0),
+                Vec2::new(1.0, 0.0),
+                Vec2::new(0.0, 1.0),
+                Vec2::new(-1.0, 0.0),
+            ] {
+                painter.circle_filled(buttons + direction * unit * 0.2, size * 0.05, color);
+            }
+        }
+        Mode::Network => {
+            // Globe: sphere, meridian, equator.
+            let radius = unit * 0.8;
+            painter.circle_stroke(center, radius, stroke);
+            painter.line_segment(
+                [center - Vec2::new(radius, 0.0), center + Vec2::new(radius, 0.0)],
+                stroke,
+            );
+            let arc = |squeeze: f32| {
+                let mut points = Vec::with_capacity(25);
+                for step in 0..=24 {
+                    let angle = step as f32 / 24.0 * std::f32::consts::TAU;
+                    points.push(
+                        center + Vec2::new(angle.cos() * radius * squeeze, angle.sin() * radius),
+                    );
+                }
+                points
+            };
+            painter.add(Shape::closed_line(arc(0.42), stroke));
+        }
+    }
 }
 
 fn shadow_text(
@@ -1051,6 +1276,72 @@ fn shadow_text(
         Color32::from_black_alpha(color.a().saturating_sub(40)),
     );
     painter.text(position, align, text, font, color);
+}
+
+/// Boot-in timeline: returns (veil alpha, wordmark alpha), or None once the
+/// intro has finished. The veil hides the interface briefly, the wordmark
+/// fades in over it and dissolves as the veil lifts.
+fn boot_phase(elapsed: f32) -> Option<(u8, u8)> {
+    const DONE: f32 = 1.9;
+    if elapsed >= DONE {
+        return None;
+    }
+    let ramp = |from: f32, to: f32| ((elapsed - from) / (to - from)).clamp(0.0, 1.0);
+    let veil = 1.0 - ramp(0.55, 1.35);
+    let wordmark = ramp(0.08, 0.42) * (1.0 - ramp(1.15, 1.65));
+    Some(((veil * 255.0) as u8, (wordmark * 255.0) as u8))
+}
+
+fn draw_boot(painter: &egui::Painter, rect: Rect, veil: u8, wordmark: u8, accent: usize) {
+    if veil > 0 {
+        painter.rect_filled(rect.shrink(1.0), 26.0, Color32::from_black_alpha(veil));
+    }
+    if wordmark > 0 {
+        let center = rect.center() - Vec2::new(0.0, rect.height() * 0.04);
+        shadow_text(
+            painter,
+            center,
+            Align2::CENTER_CENTER,
+            "XMB",
+            FontId::proportional(58.0),
+            Color32::from_white_alpha(wordmark),
+        );
+        shadow_text(
+            painter,
+            center + Vec2::new(0.0, 44.0),
+            Align2::CENTER_CENTER,
+            "L A U N C H E R",
+            FontId::proportional(15.0),
+            tint(accent_color(accent), wordmark.saturating_sub(45)),
+        );
+    }
+}
+
+fn spawn_steam_art_fetch(state: &AppState, sender: Sender<(String, Option<PathBuf>)>) {
+    let missing = state
+        .items
+        .get(&Mode::Game)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.art.is_none())
+                .filter_map(|item| match item.action {
+                    Action::Steam(app_id) => Some((item.id.clone(), app_id)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if missing.is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        for (item_id, app_id) in missing {
+            if let Some(path) = sources::fetch_steam_cover(app_id) {
+                let _ = sender.send((item_id, Some(path)));
+            }
+        }
+    });
 }
 
 fn draw_toast(painter: &egui::Painter, rect: Rect, message: &str) {
@@ -1079,13 +1370,6 @@ fn adjust_setting(action: SettingAction, settings: &mut Settings) {
         SettingAction::Sound => settings.sound = !settings.sound,
         SettingAction::ReducedMotion => settings.reduced_motion = !settings.reduced_motion,
         SettingAction::NetworkArtwork => settings.network_artwork = !settings.network_artwork,
-        SettingAction::PanelWidth => {
-            settings.panel_width = if settings.panel_width >= 180 {
-                90
-            } else {
-                settings.panel_width + 15
-            };
-        }
         SettingAction::ResetAppearance => {
             let defaults = Settings::default();
             settings.theme = defaults.theme;
@@ -1191,9 +1475,39 @@ mod tests {
     #[test]
     fn monthly_palette_has_distinct_ends() {
         for month in 0..12 {
-            let [top, bottom] = monthly_palette(month, 0);
+            let [top, bottom] = monthly_palette(month, 0, true);
             assert_ne!(top, bottom);
         }
+    }
+
+    #[test]
+    fn opaque_mode_removes_translucency() {
+        for color in monthly_palette(3, 0, false) {
+            assert_eq!(color.a(), 255);
+        }
+        for color in monthly_palette(3, 0, true) {
+            assert!(color.a() < 255);
+        }
+    }
+
+    #[test]
+    fn accents_are_distinct() {
+        let colors = (0..5).map(accent_color).collect::<Vec<_>>();
+        for (index, color) in colors.iter().enumerate() {
+            assert!(!colors[..index].contains(color));
+        }
+    }
+
+    #[test]
+    fn boot_timeline_covers_veil_then_wordmark_then_ends() {
+        let (veil, wordmark) = boot_phase(0.0).unwrap();
+        assert_eq!(veil, 255);
+        assert_eq!(wordmark, 0);
+        let (_, wordmark) = boot_phase(0.8).unwrap();
+        assert!(wordmark > 200);
+        let (veil, _) = boot_phase(1.5).unwrap();
+        assert_eq!(veil, 0);
+        assert!(boot_phase(1.9).is_none());
     }
 
     #[test]

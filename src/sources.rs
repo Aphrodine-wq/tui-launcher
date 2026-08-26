@@ -139,16 +139,19 @@ pub fn discover_games() -> Vec<LibraryItem> {
                 continue;
             }
             let art_dir = artwork_root.join(app_id.to_string());
+            let cached_cover = steam_cover_cache_path(app_id).filter(|path| path.is_file());
             let art = first_file(&[
                 art_dir.join("library_600x900.jpg"),
                 art_dir.join("header.jpg"),
                 art_dir.join("logo.png"),
-            ]);
+            ])
+            .or_else(|| cached_cover.clone());
             let hero = first_file(&[
                 art_dir.join("library_hero.jpg"),
                 art_dir.join("library_hero_blur.jpg"),
                 art_dir.join("header.jpg"),
-            ]);
+            ])
+            .or(cached_cover);
             let last_played = vdf
                 .get_str(&["LastPlayed"])
                 .and_then(|value| value.parse::<u64>().ok())
@@ -510,8 +513,9 @@ pub fn setting_items(settings: &Settings) -> Vec<LibraryItem> {
         ),
         (
             "accent",
-            "Accent",
-            format!("{} / 5", settings.accent + 1),
+            "Wave accent",
+            crate::model::ACCENT_NAMES[settings.accent.min(crate::model::ACCENT_NAMES.len() - 1)]
+                .to_owned(),
             SettingAction::Accent,
         ),
         (
@@ -540,15 +544,9 @@ pub fn setting_items(settings: &Settings) -> Vec<LibraryItem> {
         ),
         (
             "network-art",
-            "Fetch missing artwork",
+            "Fetch missing Steam artwork",
             on_off(settings.network_artwork),
             SettingAction::NetworkArtwork,
-        ),
-        (
-            "panel-width",
-            "Overlay width",
-            settings.panel_width.to_string(),
-            SettingAction::PanelWidth,
         ),
         (
             "reset",
@@ -652,6 +650,47 @@ fn resolve_icon(icon: &str) -> Option<PathBuf> {
         .with_size(128)
         .with_cache()
         .find()
+}
+
+pub fn steam_cover_cache_path(app_id: u32) -> Option<PathBuf> {
+    Some(
+        crate::config::paths()?
+            .cache
+            .join("steam-art")
+            .join(format!("{app_id}.jpg")),
+    )
+}
+
+/// Download boxart for a Steam title that has no local artwork yet. Results
+/// are cached; the overlay only calls this when "Fetch missing Steam
+/// artwork" is enabled.
+pub fn fetch_steam_cover(app_id: u32) -> Option<PathBuf> {
+    let output = steam_cover_cache_path(app_id)?;
+    if output.is_file() {
+        return Some(output);
+    }
+    fs::create_dir_all(output.parent()?).ok()?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .into();
+    for variant in ["library_600x900.jpg", "header.jpg"] {
+        let url =
+            format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{app_id}/{variant}");
+        let Ok(mut response) = agent.get(&url).call() else {
+            continue;
+        };
+        let Ok(bytes) = response.body_mut().read_to_vec() else {
+            continue;
+        };
+        if bytes.len() < 512 {
+            continue;
+        }
+        if fs::write(&output, &bytes).is_ok() {
+            return Some(output);
+        }
+    }
+    None
 }
 
 fn steam_root() -> Option<PathBuf> {
