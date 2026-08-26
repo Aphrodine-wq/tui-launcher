@@ -128,6 +128,11 @@ pub fn discover_applications() -> Vec<DiscoveredApp> {
         if !seen.insert(entry.id().to_ascii_lowercase()) || !entry_is_visible(&entry, &desktops) {
             continue;
         }
+        // The launcher's own desktop entry exists so Walker can start it;
+        // it has no business listing itself.
+        if entry.id().eq_ignore_ascii_case("xmb-launcher") {
+            continue;
+        }
         let Some(name) = entry.name(&locales).map(|name| name.into_owned()) else {
             continue;
         };
