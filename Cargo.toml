@@ -1,6 +1,6 @@
 [package]
 name = "tui-launcher"
-version = "0.8.1"
+version = "0.11.0"
 edition = "2024"
 description = "A native PSP-inspired XMB desktop overlay for Linux"
 license = "MIT"
@@ -17,7 +17,7 @@ gilrs = "0.11.2"
 image = { version = "0.25.10", default-features = false, features = ["ico", "jpeg", "png", "webp"] }
 mpris = "2.1.0"
 resvg = { version = "0.48.1", default-features = false, features = ["raster-images", "svgz", "text", "system-fonts"] }
-rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav", "mp3", "flac", "vorbis", "mp4"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 steam-vdf-parser = "0.1.2"

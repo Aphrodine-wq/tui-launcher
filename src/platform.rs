@@ -22,7 +22,15 @@ pub fn execute(action: &Action) -> Result<String> {
         Action::Media(control) => control_media(control),
         Action::Network(action) => network_action(action),
         Action::System(action) => system_action(action),
-        Action::Setting(_) | Action::Group(_) | Action::Wifi | Action::SystemInfo | Action::Exit => Ok(String::new()),
+        Action::Setting(_)
+        | Action::Group(_)
+        | Action::Wifi
+        | Action::SystemInfo
+        | Action::Folder(_)
+        | Action::Clock
+        | Action::AudioOutput
+        | Action::Help
+        | Action::Exit => Ok(String::new()),
     }
 }
 
@@ -114,6 +122,12 @@ fn control_media(control: &MediaControl) -> Result<String> {
 
 fn system_action(action: &SystemAction) -> Result<String> {
     match action {
+        SystemAction::ScreenOff => {
+            if !is_hyprland() {
+                bail!("screen off needs Hyprland");
+            }
+            status("hyprctl", &["dispatch", "dpms", "off"])?;
+        }
         SystemAction::VolumeDown => {
             if command_exists("wpctl") {
                 status("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"])?;
@@ -165,6 +179,7 @@ fn system_action(action: &SystemAction) -> Result<String> {
         SystemAction::PowerSaver | SystemAction::Balanced | SystemAction::Performance => {
             "Power profile changed"
         }
+        SystemAction::ScreenOff => "Displays off — press any button to wake",
         SystemAction::Lock => "Session locked",
         SystemAction::Logout => "Logging out",
         SystemAction::Suspend => "Suspending",

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=XMB Launcher
+Comment=PSP-style console shell as a desktop session
+Exec=cage -- tui-launcher --kiosk
+Type=Application
+DesktopNames=XMB

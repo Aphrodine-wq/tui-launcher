@@ -1,8 +1,11 @@
+mod backgrounds;
 mod config;
 mod feedback;
 mod gui;
 mod input;
+mod media;
 mod model;
+mod music;
 mod platform;
 mod sources;
 mod sysinfo;
@@ -21,6 +24,10 @@ struct Cli {
     /// Open as a full monitor console shell instead of a desktop overlay.
     #[arg(long)]
     fullscreen: bool,
+    /// Kiosk mode: fullscreen, and never offer to close the launcher — for
+    /// running it as the whole desktop (see scripts/install-session.sh).
+    #[arg(long)]
+    kiosk: bool,
     #[arg(long, value_enum)]
     start: Option<StartMode>,
     /// Use this picture as the background for this run without saving it.
@@ -38,6 +45,7 @@ struct Cli {
 enum StartMode {
     Settings,
     Extras,
+    Apps,
     Photo,
     Music,
     Video,
@@ -50,6 +58,7 @@ impl From<StartMode> for Mode {
         match value {
             StartMode::Settings => Self::Settings,
             StartMode::Extras => Self::Extras,
+            StartMode::Apps => Self::Apps,
             StartMode::Photo => Self::Photo,
             StartMode::Music => Self::Music,
             StartMode::Video => Self::Video,
@@ -74,10 +83,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    config::set_kiosk(cli.kiosk);
+    let fullscreen = cli.fullscreen || cli.kiosk;
     let (settings, migrated) = Settings::load();
     let persisted = config::PersistentState::load();
     let start = cli.start.map(Mode::from).unwrap_or(persisted.last_mode);
-    let size = if cli.fullscreen {
+    let size = if fullscreen {
         egui::vec2(1280.0, 720.0)
     } else {
         egui::vec2(1180.0, 664.0)
@@ -90,12 +101,12 @@ fn main() -> Result<()> {
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(true)
-        .with_fullscreen(cli.fullscreen)
+        .with_fullscreen(fullscreen)
         .with_window_level(egui::WindowLevel::AlwaysOnTop);
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Wgpu,
-        centered: !cli.fullscreen,
+        centered: !fullscreen,
         persist_window: false,
         ..Default::default()
     };
@@ -146,8 +157,10 @@ mod tests {
     #[test]
     fn authentic_category_order_is_stable() {
         assert_eq!(Mode::ALL[0], Mode::Settings);
-        assert_eq!(Mode::ALL[5], Mode::Game);
-        assert_eq!(Mode::ALL[6], Mode::Network);
+        assert_eq!(Mode::ALL[1], Mode::Extras);
+        assert_eq!(Mode::ALL[2], Mode::Apps);
+        assert_eq!(Mode::ALL[6], Mode::Game);
+        assert_eq!(Mode::ALL[7], Mode::Network);
     }
 
     #[test]

@@ -12,6 +12,20 @@ use crate::model::{BindingTarget, Mode};
 
 pub const CONFIG_VERSION: u8 = 5;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Kiosk mode: the launcher is the whole desktop, so it never offers to
+/// close itself. Set once from the CLI at startup.
+static KIOSK: AtomicBool = AtomicBool::new(false);
+
+pub fn set_kiosk(value: bool) {
+    KIOSK.store(value, Ordering::Relaxed);
+}
+
+pub fn is_kiosk() -> bool {
+    KIOSK.load(Ordering::Relaxed)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Settings {
@@ -29,10 +43,17 @@ pub struct Settings {
     pub animation_speed: usize,
     pub panel_width: u16,
     pub waves: bool,
+    pub starfield: bool,
+    pub comets: bool,
+    pub grid_floor: bool,
     pub sound: bool,
     pub sound_volume: f32,
     pub rumble: bool,
     pub rumble_strength: f32,
+    /// Analog-stick activation threshold (0.10–0.60).
+    pub stick_deadzone: f32,
+    /// Hold-to-repeat interval in ms; 0 disables key/stick repeat.
+    pub nav_repeat_ms: u16,
     pub reduced_motion: bool,
     pub network_artwork: bool,
     pub default_fullscreen: bool,
@@ -42,6 +63,8 @@ pub struct Settings {
     pub sparkles: bool,
     pub boot_animation: bool,
     pub clock_24h: bool,
+    /// Minutes without input before the clock screen; 0 disables it.
+    pub idle_clock_minutes: u8,
     pub media_paths: Vec<PathBuf>,
     pub controller: ControllerBindings,
 }
@@ -63,10 +86,15 @@ impl Default for Settings {
             animation_speed: 1,
             panel_width: 110,
             waves: true,
+            starfield: true,
+            comets: false,
+            grid_floor: false,
             sound: true,
             sound_volume: 0.22,
             rumble: false,
             rumble_strength: 0.55,
+            stick_deadzone: 0.35,
+            nav_repeat_ms: 0,
             reduced_motion: false,
             network_artwork: false,
             default_fullscreen: false,
@@ -76,6 +104,7 @@ impl Default for Settings {
             sparkles: true,
             boot_animation: true,
             clock_24h: false,
+            idle_clock_minutes: 5,
             media_paths: default_media_paths(),
             controller: ControllerBindings::default(),
         }
@@ -157,6 +186,23 @@ impl ControllerBindings {
         self.set(target, next);
     }
 
+    /// Assign an exact button name to a target. If another target already
+    /// holds it, they swap so every action keeps a distinct button.
+    /// Unknown button names are ignored.
+    pub fn bind(&mut self, target: BindingTarget, button: &str) {
+        if !Self::BUTTONS.contains(&button) {
+            return;
+        }
+        let old = self.get(target).to_owned();
+        if let Some(other) = BindingTarget::ALL
+            .into_iter()
+            .find(|other| *other != target && self.get(*other) == button)
+        {
+            self.set(other, old);
+        }
+        self.set(target, button.to_owned());
+    }
+
     fn normalize(&mut self) {
         let values = BindingTarget::ALL
             .into_iter()
@@ -200,10 +246,14 @@ impl Settings {
         self.panel_width = self.panel_width.clamp(50, 600);
         self.sound_volume = self.sound_volume.clamp(0.0, 1.0);
         self.rumble_strength = self.rumble_strength.clamp(0.0, 1.0);
-        if !matches!(
-            self.background_mode.as_str(),
-            "gradient" | "picture" | "wallpaper"
-        ) {
+        self.stick_deadzone = self.stick_deadzone.clamp(0.10, 0.60);
+        self.nav_repeat_ms = if self.nav_repeat_ms == 0 {
+            0
+        } else {
+            self.nav_repeat_ms.clamp(80, 600)
+        };
+        self.idle_clock_minutes = self.idle_clock_minutes.min(30);
+        if !matches!(self.background_mode.as_str(), "gradient" | "picture") {
             self.background_mode = "gradient".to_owned();
         }
         if self.media_paths.is_empty() {
@@ -252,9 +302,13 @@ impl Settings {
 #[serde(default)]
 pub struct PersistentState {
     pub favorites: HashSet<String>,
+    /// Application ids hidden from the columns (Options → Hide).
+    pub hidden: HashSet<String>,
     pub recents: HashMap<String, Vec<String>>,
     pub last_mode: Mode,
     pub selected: HashMap<String, String>,
+    /// Whether the first-run controls hint has been shown.
+    pub hint_shown: bool,
 }
 
 impl PersistentState {

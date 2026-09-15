@@ -8,6 +8,7 @@ pub enum Mode {
     #[default]
     Settings,
     Extras,
+    Apps,
     Photo,
     Music,
     Video,
@@ -16,9 +17,10 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Settings,
         Self::Extras,
+        Self::Apps,
         Self::Photo,
         Self::Music,
         Self::Video,
@@ -30,6 +32,7 @@ impl Mode {
         match self {
             Self::Settings => "SETTINGS",
             Self::Extras => "EXTRAS",
+            Self::Apps => "APPS",
             Self::Photo => "PHOTO",
             Self::Music => "MUSIC",
             Self::Video => "VIDEO",
@@ -67,6 +70,7 @@ pub enum SystemAction {
     PowerSaver,
     Balanced,
     Performance,
+    ScreenOff,
     Lock,
     Logout,
     Suspend,
@@ -95,6 +99,10 @@ pub enum Action {
     Group(SettingsGroup),
     Wifi,
     SystemInfo,
+    Folder(PathBuf),
+    Clock,
+    AudioOutput,
+    Help,
     Exit,
 }
 
@@ -107,7 +115,12 @@ pub enum SettingsGroup {
 }
 
 impl SettingsGroup {
-    pub const ALL: [Self; 4] = [Self::Appearance, Self::Controller, Self::System, Self::Power];
+    pub const ALL: [Self; 4] = [
+        Self::Appearance,
+        Self::Controller,
+        Self::System,
+        Self::Power,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -120,9 +133,9 @@ impl SettingsGroup {
 
     pub fn subtitle(self) -> &'static str {
         match self {
-            Self::Appearance => "Background, waves, accent, motion, sound",
+            Self::Appearance => "Background, waves, accent, idle clock, sound",
             Self::Controller => "Button mappings",
-            Self::System => "Network, volume, brightness, power profile",
+            Self::System => "Network, audio output, brightness, hidden apps",
             Self::Power => "Lock, session, and power controls",
         }
     }
@@ -140,12 +153,23 @@ pub enum SettingAction {
     NetworkArtwork,
     Background,
     BackgroundMode,
-    WallpaperScene,
     ThemePack,
     Sparkles,
+    Starfield,
+    Comets,
+    GridFloor,
+    DefaultBackground,
     BootAnimation,
     Clock24h,
+    IdleClock,
+    RestoreHidden,
     ResetAppearance,
+    StickDeadzone,
+    NavRepeat,
+    Rumble,
+    RumbleStrength,
+    TestController,
+    ResetController,
     Binding(BindingTarget),
 }
 
@@ -201,6 +225,11 @@ pub struct LibraryItem {
     pub action: Action,
     pub available: bool,
     pub unavailable_reason: Option<String>,
+    /// Favorites and recents are recorded under this id instead (the
+    /// Continue row stands in for a real game).
+    pub alias_of: Option<String>,
+    /// Unix time of the last play session, when the source knows it.
+    pub last_played: u64,
 }
 
 impl LibraryItem {
@@ -215,6 +244,8 @@ impl LibraryItem {
             action,
             available: true,
             unavailable_reason: None,
+            alias_of: None,
+            last_played: 0,
         }
     }
 

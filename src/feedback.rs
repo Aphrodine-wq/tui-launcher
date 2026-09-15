@@ -15,7 +15,7 @@ pub enum Tone {
 }
 
 pub struct AudioFeedback {
-    _stream: MixerDeviceSink,
+    stream: MixerDeviceSink,
     player: Player,
 }
 
@@ -23,10 +23,12 @@ impl AudioFeedback {
     pub fn new() -> Option<Self> {
         let stream = DeviceSinkBuilder::open_default_sink().ok()?;
         let player = Player::connect_new(stream.mixer());
-        Some(Self {
-            _stream: stream,
-            player,
-        })
+        Some(Self { stream, player })
+    }
+
+    /// The shared output mixer, so music can play beside interface sounds.
+    pub fn mixer(&self) -> &rodio::mixer::Mixer {
+        self.stream.mixer()
     }
 
     /// Play a theme pack's audio sample for this tone, or the built-in

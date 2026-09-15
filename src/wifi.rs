@@ -67,7 +67,14 @@ pub fn snapshot(rescan: bool) -> WifiSnapshot {
 
 pub fn connect(device: &str, ssid: &str, passphrase: Option<&str>) -> Result<String> {
     match passphrase {
-        Some(passphrase) => iwctl(&["--passphrase", passphrase, "station", device, "connect", ssid])?,
+        Some(passphrase) => iwctl(&[
+            "--passphrase",
+            passphrase,
+            "station",
+            device,
+            "connect",
+            ssid,
+        ])?,
         None => iwctl(&["station", device, "connect", ssid])?,
     };
     Ok(format!("Connected to {ssid}"))
@@ -99,7 +106,11 @@ fn iwctl(args: &[&str]) -> Result<String> {
     if !output.status.success() {
         let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
         let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
-        let message = if stderr.trim().is_empty() { stdout } else { stderr };
+        let message = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
         return Err(anyhow!("{}", message.trim().to_owned()));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())

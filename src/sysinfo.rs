@@ -112,14 +112,19 @@ mod tests {
             parse_os_release("NAME=\"Arch Linux\"\nPRETTY_NAME=\"Arch Linux\"\n"),
             Some("Arch Linux".to_owned())
         );
-        assert_eq!(parse_uptime("93784.21 512341.11\n"), Some("1d 2h 3m".to_owned()));
+        assert_eq!(
+            parse_uptime("93784.21 512341.11\n"),
+            Some("1d 2h 3m".to_owned())
+        );
         assert_eq!(parse_uptime("754.0 100.0\n"), Some("12m".to_owned()));
         assert_eq!(
             parse_cpu_model("processor\t: 0\nmodel name\t: AMD Ryzen 7 5800X\n"),
             Some("AMD Ryzen 7 5800X".to_owned())
         );
         assert_eq!(
-            parse_memory("MemTotal:       32805912 kB\nMemFree:  1 kB\nMemAvailable:   16402956 kB\n"),
+            parse_memory(
+                "MemTotal:       32805912 kB\nMemFree:  1 kB\nMemAvailable:   16402956 kB\n"
+            ),
             Some("15.6 GiB free of 31.3 GiB".to_owned())
         );
     }

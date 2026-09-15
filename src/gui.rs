@@ -16,16 +16,23 @@ use eframe::egui::{
 use image::{DynamicImage, ImageBuffer, Rgba};
 
 use crate::{
+    backgrounds,
     config::{PersistentState, Settings, paths},
     feedback::{AudioFeedback, Tone},
     input::{ControllerInput, InputAction},
-    model::{Action, AppState, LibraryItem, Mode, SettingAction, SettingsGroup},
+    media::{self, MediaKind},
+    model::{Action, AppState, BindingTarget, LibraryItem, Mode, SettingAction, SettingsGroup},
+    music::{MusicPlayer, Track},
     platform, sources, sysinfo,
     theme::{self, ThemePack},
     wifi,
 };
 
-const FRAME_TIME: Duration = Duration::from_millis(16);
+/// Frame cap for active navigation (~60 fps) — crisp sliding motion.
+const NAV_FRAME: Duration = Duration::from_millis(16);
+/// Frame cap for slow ambient effects (~30 fps) — smooth for drifting
+/// waves and stars at a fraction of the cost of full-rate rendering.
+const AMBIENT_FRAME: Duration = Duration::from_millis(33);
 
 /// Texture resolution tier. Icons get a small CPU-downscaled texture so they
 /// stay crisp at list size (the wgpu backend has no mipmaps); heroes and
@@ -47,7 +54,23 @@ enum OptionEntry {
     Favorite,
     Information,
     SetBackground(PathBuf),
+    Hide,
+    MusicPause,
+    MusicPrevious,
+    MusicNext,
+    MusicStop,
     Close,
+}
+
+/// One step into a media folder: what to restore when backing out.
+struct FolderLevel {
+    path: PathBuf,
+    parent_items: Vec<LibraryItem>,
+    parent_selection: usize,
+}
+
+struct ClockScreen {
+    opened: Instant,
 }
 
 /// State for the native Wi-Fi panel (iwd backed), opened from
@@ -102,6 +125,20 @@ pub struct XmbApp {
     last_media_refresh: Instant,
     message_tx: Sender<String>,
     message_rx: Receiver<String>,
+    wallpapers: Vec<PathBuf>,
+    folders: HashMap<Mode, Vec<FolderLevel>>,
+    clock: Option<ClockScreen>,
+    last_input: Instant,
+    /// Hidden behind a launched window; idle time does not count.
+    away: bool,
+    music: Option<MusicPlayer>,
+    /// Active press-to-bind capture, if any.
+    rebind: Option<BindingTarget>,
+    tester_open: bool,
+    /// Hold-to-repeat navigation state.
+    repeat_dir: Option<InputAction>,
+    repeat_next: Instant,
+    help_open: bool,
 }
 
 impl XmbApp {
@@ -109,18 +146,27 @@ impl XmbApp {
         creation: &eframe::CreationContext<'_>,
         settings: Settings,
         migrated: bool,
-        persisted: PersistentState,
+        mut persisted: PersistentState,
         start: Mode,
         background_override: Option<PathBuf>,
     ) -> Self {
         install_fonts(&creation.egui_ctx);
         creation.egui_ctx.set_visuals(egui::Visuals::dark());
+        // First-run hint: shown once, then remembered.
+        let hint = (!persisted.hint_shown).then(|| {
+            persisted.hint_shown = true;
+            (
+                "Press T for options  ·  Extras → Controls & Help  ·  H for controls".to_owned(),
+                Instant::now(),
+            )
+        });
         let items = sources::discover_all(&settings, &persisted);
         let mut state = AppState::new(start, items);
         restore_selections(&mut state, &persisted);
         state.system_status = sources::system_status();
         refresh_now_playing(&mut state);
-        let controller = ControllerInput::new(settings.controller.clone());
+        let mut controller = ControllerInput::new(settings.controller.clone());
+        controller.set_deadzone(settings.stick_deadzone);
         state.controller_name = controller.name.clone();
         let item_positions = Mode::ALL
             .into_iter()
@@ -138,11 +184,14 @@ impl XmbApp {
             spawn_steam_art_fetch(&state, art_tx.clone());
         }
         let pack = settings.theme_pack.as_deref().and_then(theme::load);
-        if settings.background_mode == "wallpaper" {
-            // Self-heal: see-through mode is black if the wallpaper died.
-            sources::ensure_wallpaper();
-        }
+        // Generate the default wallpapers if missing; rendering is off-thread
+        // so startup stays instant, but the paths are known immediately.
+        let wallpapers: Vec<PathBuf> = backgrounds::list().into_iter().map(|w| w.path).collect();
+        thread::spawn(|| {
+            let _ = backgrounds::ensure_defaults();
+        });
         let audio = AudioFeedback::new();
+        let music = audio.as_ref().map(|audio| MusicPlayer::new(audio.mixer()));
         if settings.sound
             && settings.boot_animation
             && let Some(audio) = &audio
@@ -180,11 +229,22 @@ impl XmbApp {
             information_open: false,
             pending_destructive: None,
             boot_at: Instant::now(),
-            toast: None,
+            toast: hint,
             last_status_refresh: Instant::now(),
             last_media_refresh: Instant::now(),
             message_tx,
             message_rx,
+            wallpapers,
+            folders: HashMap::new(),
+            clock: None,
+            last_input: Instant::now(),
+            away: false,
+            music,
+            rebind: None,
+            tester_open: false,
+            repeat_dir: None,
+            repeat_next: Instant::now(),
+            help_open: false,
         }
     }
 
@@ -265,6 +325,8 @@ impl XmbApp {
             self.last_media_refresh = Instant::now();
         }
         while let Ok(message) = self.message_rx.try_recv() {
+            self.away = false;
+            self.last_input = Instant::now();
             self.toast(message);
         }
         while let Ok((id, path)) = self.art_rx.try_recv() {
@@ -278,7 +340,73 @@ impl XmbApp {
         {
             self.toast = None;
         }
-        ctx.request_repaint_after(FRAME_TIME);
+        let started = self.music.as_mut().and_then(MusicPlayer::tick);
+        if let Some(title) = started {
+            self.toast(format!("Now playing {title}"));
+        }
+        let idle_after = u64::from(self.settings.idle_clock_minutes) * 60;
+        if idle_after > 0
+            && !self.away
+            && self.clock.is_none()
+            && self.pending_destructive.is_none()
+            && self.last_input.elapsed() >= Duration::from_secs(idle_after)
+        {
+            self.clock = Some(ClockScreen {
+                opened: Instant::now(),
+            });
+        }
+        // Repaint policy: render at the display's refresh while anything is
+        // animating (smooth motion on high-refresh screens), poll slowly for
+        // controller input when otherwise idle, and let egui sleep when there
+        // is no controller (keyboard/pointer events wake it).
+        // Repaint policy, cheapest first: active navigation gets a high frame
+        // rate; slow ambient motion ticks at ~30 fps; an idle interface with
+        // a controller polls for input; otherwise egui sleeps until an event.
+        if self.is_easing() {
+            ctx.request_repaint_after(NAV_FRAME);
+        } else if self.is_ambient_animating() {
+            ctx.request_repaint_after(AMBIENT_FRAME);
+        } else if self.state.controller_name.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
+
+    /// Whether the interface needs to keep repainting: live effects, an
+    /// in-flight animation, or time-driven UI (toast, boot, clock, panels,
+    /// background work).
+    /// Interactive motion still settling toward its target — this wants a
+    /// high frame rate so navigation feels crisp.
+    fn is_easing(&self) -> bool {
+        if self.settings.reduced_motion {
+            return false;
+        }
+        (self.category_position - self.state.mode.index() as f32).abs() > 0.01
+            || self.item_positions.iter().any(|(mode, pos)| {
+                (pos - self.state.selections.get(mode).copied().unwrap_or(0) as f32).abs() > 0.01
+            })
+            || self
+                .submenu
+                .as_ref()
+                .is_some_and(|menu| (menu.position - menu.selection as f32).abs() > 0.01)
+    }
+
+    /// Slow ambient motion (background effects, clock, boot) or time-driven
+    /// UI that needs to keep ticking but is fine at a low frame rate.
+    fn is_ambient_animating(&self) -> bool {
+        let effects_live = !self.settings.reduced_motion
+            && (self.settings.waves
+                || self.settings.starfield
+                || self.settings.comets
+                || self.settings.grid_floor);
+        effects_live
+            || self.toast.is_some()
+            || self.clock.is_some()
+            || self.wifi.as_ref().is_some_and(|wifi| wifi.refreshing)
+            || self.music.as_ref().and_then(MusicPlayer::current).is_some()
+            || !self.art_pending.is_empty()
+            || (!self.settings.reduced_motion
+                && self.settings.boot_animation
+                && boot_phase(self.boot_at.elapsed().as_secs_f32()).is_some())
     }
 
     fn collect_input(&mut self, ctx: &egui::Context) -> Vec<InputAction> {
@@ -331,10 +459,85 @@ impl XmbApp {
                 }
             }
         });
+        let moved =
+            ctx.input(|input| input.pointer.delta() != Vec2::ZERO || input.pointer.any_pressed());
+        if moved || !actions.is_empty() {
+            self.last_input = Instant::now();
+        }
+        if moved && self.clock.take().is_some() {
+            self.feedback(Tone::Back);
+        }
+        self.apply_repeat(ctx, &mut actions);
         actions
     }
 
+    /// Hold-to-repeat: when a direction is held past an initial delay, emit
+    /// the matching nav action every `nav_repeat_ms`. Keyboard arrows and
+    /// the controller D-pad both count as held. Off when the interval is 0
+    /// or while a panel/capture is up.
+    fn apply_repeat(&mut self, ctx: &egui::Context, actions: &mut Vec<InputAction>) {
+        let interval = self.settings.nav_repeat_ms;
+        if interval == 0 || self.rebind.is_some() || self.tester_open || self.wifi.is_some() {
+            self.repeat_dir = None;
+            return;
+        }
+        let held = self.held_direction(ctx);
+        let now = Instant::now();
+        match held {
+            Some(action) if self.repeat_dir == Some(action) => {
+                if now >= self.repeat_next {
+                    actions.push(action);
+                    self.repeat_next = now + Duration::from_millis(u64::from(interval));
+                }
+            }
+            Some(action) => {
+                // Newly held: wait an initial delay before repeating.
+                self.repeat_dir = Some(action);
+                self.repeat_next = now + Duration::from_millis(400);
+            }
+            None => self.repeat_dir = None,
+        }
+    }
+
+    /// The single nav direction currently held (keyboard arrow or D-pad),
+    /// vertical taking priority over horizontal.
+    fn held_direction(&self, ctx: &egui::Context) -> Option<InputAction> {
+        let (mut up, mut down, mut left, mut right) = ctx.input(|input| {
+            (
+                input.key_down(Key::ArrowUp),
+                input.key_down(Key::ArrowDown),
+                input.key_down(Key::ArrowLeft),
+                input.key_down(Key::ArrowRight),
+            )
+        });
+        for (name, pressed) in self.controller.button_states() {
+            match (name, pressed) {
+                ("dpad-up", true) => up = true,
+                ("dpad-down", true) => down = true,
+                ("dpad-left", true) => left = true,
+                ("dpad-right", true) => right = true,
+                _ => {}
+            }
+        }
+        if up {
+            Some(InputAction::PreviousItem)
+        } else if down {
+            Some(InputAction::NextItem)
+        } else if left {
+            Some(InputAction::PreviousMode)
+        } else if right {
+            Some(InputAction::NextMode)
+        } else {
+            None
+        }
+    }
+
     fn handle_action(&mut self, action: InputAction, ctx: &egui::Context) {
+        if self.clock.take().is_some() {
+            // The wake-up press is consumed by the clock screen.
+            self.feedback(Tone::Back);
+            return;
+        }
         if self.information_open {
             if matches!(
                 action,
@@ -397,10 +600,13 @@ impl XmbApp {
                 }
             }
             InputAction::Favorite => self.toggle_favorite(),
-            // Back at the root deliberately does nothing: closing the whole
-            // overlay is a Settings → Power → Close overlay action, so a
-            // stray ○ press can't dismiss the launcher.
-            InputAction::Back => {}
+            // Back steps out of a media folder; at the root it deliberately
+            // does nothing: closing the whole overlay is a Settings → Power
+            // → Close overlay action, so a stray ○ press can't dismiss the
+            // launcher.
+            InputAction::Back => {
+                self.leave_folder();
+            }
             InputAction::Confirm => self.confirm(ctx),
         }
     }
@@ -408,7 +614,9 @@ impl XmbApp {
     fn option_entries(&self) -> Vec<(String, OptionEntry)> {
         let mut entries = Vec::new();
         let item = self.state.selected_item();
-        if !matches!(self.state.mode, Mode::Settings | Mode::Network) {
+        let mode = self.state.mode;
+        let curated = matches!(mode, Mode::Settings | Mode::Network | Mode::Extras);
+        if !curated && item.is_some_and(|item| item.id != "game:continue") {
             let favorite = item.is_some_and(|item| self.persisted.favorites.contains(&item.id));
             entries.push((
                 if favorite {
@@ -420,13 +628,33 @@ impl XmbApp {
                 OptionEntry::Favorite,
             ));
         }
-        if self.state.mode == Mode::Photo
+        if mode == Mode::Music
+            && let Some(player) = &self.music
+            && player.current().is_some()
+        {
+            entries.push((
+                if player.is_paused() {
+                    "Resume"
+                } else {
+                    "Pause"
+                }
+                .to_owned(),
+                OptionEntry::MusicPause,
+            ));
+            entries.push(("Previous Track".to_owned(), OptionEntry::MusicPrevious));
+            entries.push(("Next Track".to_owned(), OptionEntry::MusicNext));
+            entries.push(("Stop Playback".to_owned(), OptionEntry::MusicStop));
+        }
+        if mode == Mode::Photo
             && let Some(Action::Open(path)) = item.map(|item| &item.action)
         {
             entries.push((
                 "Set as Background".to_owned(),
                 OptionEntry::SetBackground(path.clone()),
             ));
+        }
+        if !curated && item.is_some_and(|item| matches!(item.action, Action::Desktop(_))) {
+            entries.push(("Hide".to_owned(), OptionEntry::Hide));
         }
         entries.push(("Information".to_owned(), OptionEntry::Information));
         entries.push(("Close".to_owned(), OptionEntry::Close));
@@ -458,6 +686,11 @@ impl XmbApp {
                         self.feedback(Tone::Confirm);
                     }
                     Some(OptionEntry::SetBackground(path)) => self.set_background(path),
+                    Some(OptionEntry::Hide) => self.hide_selected(),
+                    Some(OptionEntry::MusicPause) => self.music_pause(),
+                    Some(OptionEntry::MusicPrevious) => self.music_skip(false),
+                    Some(OptionEntry::MusicNext) => self.music_skip(true),
+                    Some(OptionEntry::MusicStop) => self.music_stop(),
                     _ => self.feedback(Tone::Back),
                 }
             }
@@ -660,7 +893,7 @@ impl XmbApp {
     }
 
     fn open_submenu(&mut self, group: SettingsGroup) {
-        let items = sources::settings_group_items(group, &self.settings);
+        let items = sources::settings_group_items(group, &self.settings, &self.persisted);
         self.submenu = Some(SubMenu {
             group,
             items,
@@ -697,36 +930,27 @@ impl XmbApp {
                 self.sysinfo_open = Some(sysinfo::gather());
                 self.feedback(Tone::Confirm);
             }
-            Action::Setting(SettingAction::WallpaperScene) => {
-                // Not a launcher setting: drives the termpaper wallpaper group.
-                let scenes = sources::termpaper_scenes();
-                if scenes.is_empty() {
-                    self.toast("termpaper is not available");
-                    self.feedback(Tone::Warning);
-                    return;
-                }
-                let next = match sources::termpaper_scene()
-                    .and_then(|current| scenes.iter().position(|scene| *scene == current))
-                {
-                    Some(index) => scenes[(index + 1) % scenes.len()].clone(),
-                    None => scenes[0].clone(),
-                };
-                if sources::termpaper_switch(&next) {
-                    sources::ensure_wallpaper();
-                    self.refresh_settings_items();
-                    self.toast(format!("Wallpaper scene: {next}"));
-                    self.feedback(Tone::Confirm);
-                } else {
-                    self.toast("Could not switch the wallpaper scene");
-                    self.feedback(Tone::Warning);
-                }
+            Action::AudioOutput => self.cycle_audio_output(),
+            Action::Setting(SettingAction::RestoreHidden) => self.restore_hidden(),
+            Action::Setting(SettingAction::DefaultBackground) => self.cycle_default_background(),
+            Action::Setting(SettingAction::Binding(target)) => {
+                self.rebind = Some(*target);
+                // Drop the button that opened this so it isn't captured.
+                self.controller.clear_pressed_button();
+                self.feedback(Tone::Confirm);
             }
+            Action::Setting(SettingAction::TestController) => {
+                self.tester_open = true;
+                self.feedback(Tone::Confirm);
+            }
+            Action::Setting(SettingAction::ResetController) => self.reset_controller(),
             Action::Setting(setting) => {
                 let setting = *setting;
                 let had_background = self.settings.background_image.is_some();
                 adjust_setting(setting, &mut self.settings);
                 self.controller
                     .set_bindings(self.settings.controller.clone());
+                self.controller.set_deadzone(self.settings.stick_deadzone);
                 self.refresh_settings_items();
                 match setting {
                     SettingAction::Background => {
@@ -750,9 +974,6 @@ impl XmbApp {
                         self.toast(format!("Theme: {name}"));
                     }
                     SettingAction::BackgroundMode => {
-                        if self.settings.background_mode == "wallpaper" {
-                            sources::ensure_wallpaper();
-                        }
                         let hint = match self.settings.background_mode.as_str() {
                             "picture"
                                 if self.settings.background_image.is_none()
@@ -764,7 +985,6 @@ impl XmbApp {
                                 "Picture mode — set one under Photo: △ Options"
                             }
                             "picture" => "Background: picture",
-                            "wallpaper" => "Background: desktop wallpaper",
                             _ => "Background: monthly gradient",
                         };
                         self.toast(hint);
@@ -816,6 +1036,31 @@ impl XmbApp {
             self.open_wifi();
             return;
         }
+        match &item.action {
+            Action::Folder(path) => {
+                let path = path.clone();
+                self.enter_folder(path);
+                return;
+            }
+            Action::Clock => {
+                self.clock = Some(ClockScreen {
+                    opened: Instant::now(),
+                });
+                self.feedback(Tone::Confirm);
+                return;
+            }
+            Action::SystemInfo => {
+                self.sysinfo_open = Some(sysinfo::gather());
+                self.feedback(Tone::Confirm);
+                return;
+            }
+            Action::Help => {
+                self.help_open = true;
+                self.feedback(Tone::Confirm);
+                return;
+            }
+            _ => {}
+        }
         if let Action::Setting(action) = item.action {
             adjust_setting(action, &mut self.settings);
             self.controller
@@ -834,7 +1079,19 @@ impl XmbApp {
             self.feedback(Tone::Warning);
             return;
         }
-        self.persisted.record_recent(self.state.mode, &item.id);
+        if self.state.mode == Mode::Music
+            && let Action::Open(path) = &item.action
+            && media::is_audio(path)
+            && self.music.is_some()
+        {
+            self.play_track(&item);
+            return;
+        }
+        let recent_id = item.alias_of.clone().unwrap_or_else(|| item.id.clone());
+        self.persisted.record_recent(self.state.mode, &recent_id);
+        if self.state.mode == Mode::Game {
+            self.refresh_continue();
+        }
         if item.action.launches_external_window() {
             self.launch_external(item.action, ctx);
         } else {
@@ -891,18 +1148,25 @@ impl XmbApp {
         let selection = self.state.selections.entry(Mode::Settings).or_default();
         *selection = (*selection).min(len.saturating_sub(1));
         if let Some(submenu) = &mut self.submenu {
-            submenu.items = sources::settings_group_items(submenu.group, &self.settings);
+            submenu.items =
+                sources::settings_group_items(submenu.group, &self.settings, &self.persisted);
             submenu.selection = submenu.selection.min(submenu.items.len().saturating_sub(1));
         }
     }
 
     fn toggle_favorite(&mut self) {
-        if matches!(self.state.mode, Mode::Settings | Mode::Network) {
+        if matches!(
+            self.state.mode,
+            Mode::Settings | Mode::Network | Mode::Extras
+        ) {
             return;
         }
         let Some(item) = self.state.selected_item().cloned() else {
             return;
         };
+        if item.id == "game:continue" {
+            return;
+        }
         let added = self.persisted.toggle_favorite(&item.id);
         if let Some(items) = self.state.items.get_mut(&self.state.mode) {
             sources::order_library(items, &self.persisted, self.state.mode);
@@ -918,6 +1182,478 @@ impl XmbApp {
         self.feedback(Tone::Confirm);
     }
 
+    fn enter_folder(&mut self, path: PathBuf) {
+        let mode = self.state.mode;
+        let kind = match mode {
+            Mode::Photo => MediaKind::Photo,
+            Mode::Music => MediaKind::Music,
+            Mode::Video => MediaKind::Video,
+            _ => return,
+        };
+        let mut items = media::list(&self.settings.media_paths, kind, Some(&path));
+        sources::order_library(&mut items, &self.persisted, mode);
+        let parent_selection = self.state.selected_index();
+        let parent_items = self.state.items.insert(mode, items).unwrap_or_default();
+        self.folders.entry(mode).or_default().push(FolderLevel {
+            path,
+            parent_items,
+            parent_selection,
+        });
+        self.state.selections.insert(mode, 0);
+        self.item_positions.insert(mode, 0.0);
+        self.options_open = false;
+        self.feedback(Tone::Confirm);
+    }
+
+    /// Step out of the current media folder; false at the root.
+    fn leave_folder(&mut self) -> bool {
+        let mode = self.state.mode;
+        let Some(level) = self.folders.get_mut(&mode).and_then(|stack| stack.pop()) else {
+            return false;
+        };
+        self.state.items.insert(mode, level.parent_items);
+        self.state.selections.insert(mode, level.parent_selection);
+        self.item_positions
+            .insert(mode, level.parent_selection as f32);
+        self.options_open = false;
+        self.feedback(Tone::Back);
+        true
+    }
+
+    fn hide_selected(&mut self) {
+        let mode = self.state.mode;
+        let Some(item) = self.state.selected_item().cloned() else {
+            return;
+        };
+        self.persisted.hidden.insert(item.id.clone());
+        if let Some(items) = self.state.items.get_mut(&mode) {
+            items.retain(|candidate| candidate.id != item.id);
+            let len = items.len();
+            let selection = self.state.selections.entry(mode).or_default();
+            *selection = (*selection).min(len.saturating_sub(1));
+        }
+        self.refresh_settings_items();
+        self.toast(format!(
+            "{} hidden — restore under Settings → System",
+            item.title
+        ));
+        self.feedback(Tone::Confirm);
+    }
+
+    /// Bring every hidden application back and rebuild the columns.
+    fn restore_hidden(&mut self) {
+        let count = self.persisted.hidden.len();
+        self.persisted.hidden.clear();
+        self.rediscover();
+        self.refresh_settings_items();
+        self.toast(format!("{count} restored"));
+        self.feedback(Tone::Confirm);
+    }
+
+    /// Rescan applications, games, and media (root level), keeping each
+    /// column's selection on the same item where it still exists.
+    fn rediscover(&mut self) {
+        let selected: HashMap<Mode, String> = Mode::ALL
+            .into_iter()
+            .filter_map(|mode| {
+                let index = self.state.selections.get(&mode).copied().unwrap_or(0);
+                self.state
+                    .items
+                    .get(&mode)?
+                    .get(index)
+                    .map(|item| (mode, item.id.clone()))
+            })
+            .collect();
+        self.folders.clear();
+        for (mode, items) in sources::discover_all(&self.settings, &self.persisted) {
+            if mode == Mode::Settings {
+                continue;
+            }
+            let index = selected
+                .get(&mode)
+                .and_then(|id| items.iter().position(|item| &item.id == id))
+                .unwrap_or(0);
+            self.state.items.insert(mode, items);
+            self.state.selections.insert(mode, index);
+            self.item_positions.insert(mode, index as f32);
+        }
+        refresh_now_playing(&mut self.state);
+    }
+
+    /// While capturing: cancel on Back, otherwise bind the next raw
+    /// controller button to the pending target (swapping any holder).
+    fn handle_rebind(&mut self, actions: &[InputAction]) {
+        let Some(target) = self.rebind else {
+            return;
+        };
+        if actions.contains(&InputAction::Back) {
+            self.rebind = None;
+            self.controller.clear_pressed_button();
+            self.feedback(Tone::Back);
+            return;
+        }
+        if let Some(button) = self.controller.take_pressed_button() {
+            self.settings.controller.bind(target, &button);
+            self.controller
+                .set_bindings(self.settings.controller.clone());
+            let _ = self.settings.save(self.migrated);
+            self.migrated = false;
+            self.refresh_settings_items();
+            self.rebind = None;
+            self.toast(format!(
+                "{} → {}",
+                target.label(),
+                sources::pretty_button(&button)
+            ));
+            self.feedback(Tone::Confirm);
+        }
+    }
+
+    fn reset_controller(&mut self) {
+        let defaults = Settings::default();
+        self.settings.controller = defaults.controller;
+        self.settings.stick_deadzone = defaults.stick_deadzone;
+        self.settings.nav_repeat_ms = defaults.nav_repeat_ms;
+        self.settings.rumble = defaults.rumble;
+        self.settings.rumble_strength = defaults.rumble_strength;
+        self.controller
+            .set_bindings(self.settings.controller.clone());
+        self.controller.set_deadzone(self.settings.stick_deadzone);
+        let _ = self.settings.save(self.migrated);
+        self.migrated = false;
+        self.refresh_settings_items();
+        self.toast("Controller reset to defaults");
+        self.feedback(Tone::Confirm);
+    }
+
+    /// Cycle the background through None → each generated wallpaper. A
+    /// wallpaper flows through the existing picture render path.
+    fn cycle_default_background(&mut self) {
+        if self.wallpapers.is_empty() {
+            self.toast("Default backgrounds are still generating");
+            self.feedback(Tone::Warning);
+            return;
+        }
+        let current = self
+            .settings
+            .background_image
+            .as_ref()
+            .and_then(|path| self.wallpapers.iter().position(|w| w == path));
+        let next = match current {
+            None => Some(0),
+            Some(index) if index + 1 < self.wallpapers.len() => Some(index + 1),
+            Some(_) => None,
+        };
+        self.background_override = None;
+        match next {
+            Some(index) => {
+                self.settings.background_image = Some(self.wallpapers[index].clone());
+                self.settings.background_mode = "picture".to_owned();
+                let name = backgrounds::list()
+                    .into_iter()
+                    .find(|w| w.path == self.wallpapers[index])
+                    .map(|w| w.name)
+                    .unwrap_or_else(|| "Background".to_owned());
+                self.toast(format!("Background: {name}"));
+            }
+            None => {
+                self.settings.background_image = None;
+                self.settings.background_mode = "gradient".to_owned();
+                self.toast("Background: monthly gradient");
+            }
+        }
+        let _ = self.settings.save(self.migrated);
+        self.migrated = false;
+        self.refresh_settings_items();
+        self.feedback(Tone::Confirm);
+    }
+
+    fn cycle_audio_output(&mut self) {
+        let sinks = sources::audio_sinks();
+        if sinks.len() < 2 {
+            self.toast(if sinks.is_empty() {
+                "No audio outputs found"
+            } else {
+                "Only one audio output is available"
+            });
+            self.feedback(Tone::Warning);
+            return;
+        }
+        let next = sinks
+            .iter()
+            .position(|sink| sink.default)
+            .map(|index| (index + 1) % sinks.len())
+            .unwrap_or(0);
+        let sink = &sinks[next];
+        if sources::set_audio_sink(sink.id) {
+            self.state.system_status = sources::system_status();
+            self.refresh_settings_items();
+            self.toast(format!("Audio output: {}", sink.name));
+            self.feedback(Tone::Confirm);
+        } else {
+            self.toast("Could not switch the audio output");
+            self.feedback(Tone::Warning);
+        }
+    }
+
+    /// Play a local track in the launcher, queueing the rest of the column.
+    fn play_track(&mut self, item: &LibraryItem) {
+        let tracks: Vec<Track> = self
+            .state
+            .mode_items()
+            .iter()
+            .filter_map(|candidate| match &candidate.action {
+                Action::Open(path) if media::is_audio(path) => Some(Track {
+                    id: candidate.id.clone(),
+                    title: candidate.title.clone(),
+                    path: path.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        let start = tracks
+            .iter()
+            .position(|track| track.id == item.id)
+            .unwrap_or(0);
+        let Some(player) = self.music.as_mut() else {
+            return;
+        };
+        let result = player.play(tracks, start);
+        self.persisted.record_recent(Mode::Music, &item.id);
+        match result {
+            Ok(()) => {
+                self.toast(format!("Playing {}", item.title));
+                self.feedback(Tone::Confirm);
+            }
+            Err(error) => {
+                self.toast(error);
+                self.feedback(Tone::Warning);
+            }
+        }
+    }
+
+    fn music_pause(&mut self) {
+        let Some(player) = self.music.as_mut() else {
+            return;
+        };
+        let paused = player.toggle_pause();
+        self.toast(if paused { "Paused" } else { "Resumed" });
+        self.feedback(Tone::Confirm);
+    }
+
+    fn music_skip(&mut self, forward: bool) {
+        let Some(player) = self.music.as_mut() else {
+            return;
+        };
+        let result = if forward {
+            player.next()
+        } else {
+            player.previous()
+        };
+        let title = player.current().map(|track| track.title.clone());
+        match (result, title) {
+            (Ok(()), Some(title)) => {
+                self.toast(format!("Playing {title}"));
+                self.feedback(Tone::Confirm);
+            }
+            (Err(error), _) => {
+                self.toast(error);
+                self.feedback(Tone::Warning);
+            }
+            _ => self.feedback(Tone::Back),
+        }
+    }
+
+    fn music_stop(&mut self) {
+        if let Some(player) = self.music.as_mut() {
+            player.stop();
+        }
+        self.toast("Playback stopped");
+        self.feedback(Tone::Back);
+    }
+
+    /// Rebuild the Continue row after a game launch so it points at the
+    /// game just started, keeping the selection on the launched item.
+    fn refresh_continue(&mut self) {
+        let selected = self.state.selected_item().map(|item| item.id.clone());
+        let Some(items) = self.state.items.get_mut(&Mode::Game) else {
+            return;
+        };
+        items.retain(|item| item.id != "game:continue");
+        if let Some(resume) = sources::continue_item(items, &self.persisted) {
+            items.insert(0, resume);
+        }
+        sources::order_library(items, &self.persisted, Mode::Game);
+        if let Some(index) = selected.and_then(|id| items.iter().position(|item| item.id == id)) {
+            self.state.selections.insert(Mode::Game, index);
+            self.item_positions.insert(Mode::Game, index as f32);
+        }
+    }
+
+    /// Controls & Help: a full-screen reference of every action with its
+    /// current keyboard key and controller button.
+    fn draw_help(&self, painter: &egui::Painter, rect: Rect) {
+        let accent = self.accent();
+        painter.rect_filled(rect.shrink(1.0), 26.0, Color32::from_black_alpha(215));
+        let panel = Rect::from_center_size(rect.center(), Vec2::new(860.0, 520.0));
+        painter.rect_filled(panel, 14.0, Color32::from_black_alpha(230));
+        painter.rect_stroke(
+            panel,
+            14.0,
+            Stroke::new(1.0, tint(accent, 150)),
+            egui::StrokeKind::Inside,
+        );
+        shadow_text(
+            painter,
+            Pos2::new(panel.center().x, panel.top() + 44.0),
+            Align2::CENTER_CENTER,
+            "CONTROLS",
+            FontId::proportional(15.0),
+            tint(accent, 230),
+        );
+        let c = &self.settings.controller;
+        let rows: [(&str, &str, String); 8] = [
+            (
+                "Move between categories",
+                "Left / Right",
+                "D-pad L / R".to_owned(),
+            ),
+            ("Move between items", "Up / Down", "D-pad U / D".to_owned()),
+            (
+                "Confirm / open",
+                "Enter",
+                sources::pretty_button(c.get(BindingTarget::Confirm)),
+            ),
+            (
+                "Back / step out",
+                "Esc",
+                sources::pretty_button(c.get(BindingTarget::Back)),
+            ),
+            (
+                "Options for the selected item",
+                "T",
+                sources::pretty_button(c.get(BindingTarget::Context)),
+            ),
+            (
+                "Add / remove favorite",
+                "F",
+                sources::pretty_button(c.get(BindingTarget::Favorite)),
+            ),
+            (
+                "Jump to Settings",
+                "S",
+                sources::pretty_button(c.get(BindingTarget::Settings)),
+            ),
+            ("Show this help", "H", "—".to_owned()),
+        ];
+        // Column header.
+        let left = panel.left() + 40.0;
+        let key_x = panel.left() + 430.0;
+        let pad_x = panel.right() - 40.0;
+        let head_y = panel.top() + 88.0;
+        for (x, label, align) in [
+            (left, "ACTION", Align2::LEFT_CENTER),
+            (key_x, "KEYBOARD", Align2::LEFT_CENTER),
+            (pad_x, "CONTROLLER", Align2::RIGHT_CENTER),
+        ] {
+            shadow_text(
+                painter,
+                Pos2::new(x, head_y),
+                align,
+                label,
+                FontId::proportional(11.0),
+                Color32::from_white_alpha(120),
+            );
+        }
+        for (index, (action, key, button)) in rows.iter().enumerate() {
+            let y = panel.top() + 124.0 + index as f32 * 44.0;
+            shadow_text(
+                painter,
+                Pos2::new(left, y),
+                Align2::LEFT_CENTER,
+                action,
+                FontId::proportional(17.0),
+                Color32::WHITE,
+            );
+            shadow_text(
+                painter,
+                Pos2::new(key_x, y),
+                Align2::LEFT_CENTER,
+                key,
+                FontId::proportional(15.0),
+                Color32::from_white_alpha(190),
+            );
+            shadow_text(
+                painter,
+                Pos2::new(pad_x, y),
+                Align2::RIGHT_CENTER,
+                button,
+                FontId::proportional(15.0),
+                tint(accent, 235),
+            );
+        }
+        shadow_text(
+            painter,
+            Pos2::new(panel.center().x, panel.bottom() - 30.0),
+            Align2::CENTER_CENTER,
+            "Rebind any button under Settings → Controller     ·     ○ / H  Close",
+            FontId::proportional(13.0),
+            Color32::from_white_alpha(170),
+        );
+    }
+
+    /// The idle/clock screen: a veil over the interface with the time and
+    /// date, dismissed by any input.
+    fn draw_clock(&self, painter: &egui::Painter, rect: Rect) {
+        let Some(clock) = &self.clock else {
+            return;
+        };
+        let fade = if self.settings.reduced_motion {
+            1.0
+        } else {
+            (clock.opened.elapsed().as_secs_f32() / 0.8).clamp(0.0, 1.0)
+        };
+        let alpha = (fade * 255.0) as u8;
+        painter.rect_filled(
+            rect.shrink(1.0),
+            26.0,
+            Color32::from_black_alpha((fade * 170.0) as u8),
+        );
+        let now = Local::now();
+        let time = now
+            .format(if self.settings.clock_24h {
+                "%H:%M"
+            } else {
+                "%-I:%M %p"
+            })
+            .to_string();
+        let center = Pos2::new(rect.center().x, rect.top() + rect.height() * 0.43);
+        shadow_text(
+            painter,
+            center,
+            Align2::CENTER_CENTER,
+            &time,
+            FontId::proportional((rect.height() * 0.17).clamp(64.0, 180.0)),
+            Color32::from_white_alpha(alpha),
+        );
+        shadow_text(
+            painter,
+            Pos2::new(center.x, center.y + rect.height() * 0.13),
+            Align2::CENTER_CENTER,
+            &now.format("%A, %B %-d").to_string(),
+            FontId::proportional(24.0),
+            tint(self.accent(), alpha),
+        );
+        shadow_text(
+            painter,
+            Pos2::new(center.x, rect.bottom() - 40.0),
+            Align2::CENTER_CENTER,
+            "Press any button",
+            FontId::proportional(13.0),
+            Color32::from_white_alpha(alpha / 2),
+        );
+    }
+
     fn feedback(&mut self, tone: Tone) {
         if self.settings.sound
             && let Some(audio) = &self.audio
@@ -927,6 +1663,20 @@ impl XmbApp {
                 self.settings.sound_volume,
                 self.pack.as_ref().and_then(|pack| pack.sound(tone)),
             );
+        }
+        if self.settings.rumble {
+            // Short, tone-shaped buzz; navigation is intentionally silent.
+            let (scale, ms) = match tone {
+                Tone::Confirm => (0.6, 45),
+                Tone::Back => (0.5, 40),
+                Tone::Warning => (1.0, 110),
+                Tone::Boot => (0.7, 90),
+                Tone::Navigate => (0.0, 0),
+            };
+            if scale > 0.0 {
+                self.controller
+                    .rumble(self.settings.rumble_strength * scale, ms);
+            }
         }
     }
 
@@ -966,8 +1716,18 @@ impl XmbApp {
         if self.sysinfo_open.is_some() {
             self.draw_sysinfo(&painter, rect);
         }
+        if self.tester_open {
+            self.draw_controller_tester(&painter, rect);
+        }
+        if let Some(target) = self.rebind {
+            draw_rebind_overlay(&painter, rect, target, self.accent());
+        }
         if let Some((message, _)) = &self.toast {
             draw_toast(&painter, rect, message);
+        }
+        self.draw_clock(&painter, rect);
+        if self.help_open {
+            self.draw_help(&painter, rect);
         }
         if !self.settings.reduced_motion
             && self.settings.boot_animation
@@ -980,27 +1740,14 @@ impl XmbApp {
     fn paint_backdrop(&mut self, ctx: &egui::Context, painter: &egui::Painter, rect: Rect) {
         let accent = self.accent();
         let pack_gradient = self.pack.as_ref().and_then(|pack| pack.gradient);
-        if self.settings.background_mode == "wallpaper" && self.background_override.is_none() {
-            // See-through: no gradient, no picture — the desktop wallpaper
-            // (termpaper animation) shows through the transparent surface,
-            // under a light scrim that keeps text and waves legible.
-            painter.add(egui::epaint::RectShape::filled(
-                rect.shrink(1.0),
-                egui::CornerRadius::same(26),
-                Color32::from_black_alpha(46),
-            ));
-            paint_background(painter, rect, self.wave_time, &self.settings, true, accent, None);
-            return;
-        }
         let background = self.background_override.clone().or_else(|| {
             if self.settings.background_mode != "picture" {
                 return None;
             }
-            self.settings.background_image.clone().or_else(|| {
-                self.pack
-                    .as_ref()
-                    .and_then(|pack| pack.background.clone())
-            })
+            self.settings
+                .background_image
+                .clone()
+                .or_else(|| self.pack.as_ref().and_then(|pack| pack.background.clone()))
         });
         let mut image_drawn = false;
         if let Some(path) = background
@@ -1054,6 +1801,18 @@ impl XmbApp {
             Color32::from_white_alpha(190),
         );
         let mut pieces = Vec::new();
+        if let Some(track) = self.music.as_ref().and_then(MusicPlayer::current) {
+            let paused = self.music.as_ref().is_some_and(MusicPlayer::is_paused);
+            pieces.push(format!(
+                "{} {}",
+                if paused { "PAUSED" } else { "▶" },
+                truncate(&track.title, 28)
+            ));
+        } else if let Some(now) = &self.state.now_playing
+            && now.status == "Playing"
+        {
+            pieces.push(format!("▶ {}", truncate(&now.title, 28)));
+        }
         if let Some(network) = &self.state.system_status.network {
             pieces.push(network.clone());
         }
@@ -1117,13 +1876,22 @@ impl XmbApp {
                 Color32::from_white_alpha(alpha),
             );
             if mode == self.state.mode {
-                let label = match &self.submenu {
-                    Some(submenu) => format!(
+                let folder = self
+                    .folders
+                    .get(&mode)
+                    .and_then(|stack| stack.last())
+                    .and_then(|level| level.path.file_name())
+                    .map(|name| name.to_string_lossy().to_uppercase());
+                let label = match (&self.submenu, folder) {
+                    (Some(submenu), _) => format!(
                         "{} · {}",
                         mode.title(),
                         submenu.group.title().to_ascii_uppercase()
                     ),
-                    None => mode.title().to_owned(),
+                    (None, Some(folder)) => {
+                        format!("{} · {}", mode.title(), truncate(&folder, 24))
+                    }
+                    (None, None) => mode.title().to_owned(),
                 };
                 shadow_text(
                     painter,
@@ -1173,6 +1941,11 @@ impl XmbApp {
         // original XMB; the ramp keeps scrolling continuous.
         let category_y = rect.top() + rect.height() * 0.30;
         let crossbar_gap = (anchor.y - category_y) - row_height * 0.25;
+        let playing = self
+            .music
+            .as_ref()
+            .and_then(MusicPlayer::current)
+            .map(|track| track.id.clone());
         for (index, item) in items.iter().enumerate() {
             let delta = index as f32 - visual;
             if delta.abs() > 4.3 {
@@ -1182,6 +1955,11 @@ impl XmbApp {
             let ramp = ramp * ramp * (3.0 - 2.0 * ramp);
             let y = anchor.y + delta * row_height - ramp * crossbar_gap;
             let active = index == selected;
+            let title = if playing.as_deref() == Some(item.id.as_str()) {
+                format!("▶ {}", item.title)
+            } else {
+                item.title.clone()
+            };
             let opacity = ((1.0 - (delta.abs() / 5.0)) * 255.0).clamp(55.0, 255.0) as u8;
             let icon_size = if active { 39.0 } else { 28.0 };
             let item_rect = Rect::from_min_size(
@@ -1215,7 +1993,10 @@ impl XmbApp {
                         egui::CornerRadius::same(3),
                         Color32::from_white_alpha(opacity),
                     )
-                    .with_texture(texture_id, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))),
+                    .with_texture(
+                        texture_id,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    ),
                 );
             } else {
                 let color = if item.available {
@@ -1223,15 +2004,22 @@ impl XmbApp {
                 } else {
                     Color32::from_gray(105)
                 };
-                let ctx = ui.ctx().clone();
-                self.draw_mode_icon(&ctx, painter, mode, Pos2::new(anchor.x, y), icon_size, color);
+                let center = Pos2::new(anchor.x, y);
+                if let Action::Folder(_) = item.action {
+                    paint_folder_icon(painter, center, icon_size, color);
+                } else if !(mode == Mode::Extras
+                    && paint_extra_icon(painter, &item.id, center, icon_size, color))
+                {
+                    let ctx = ui.ctx().clone();
+                    self.draw_mode_icon(&ctx, painter, mode, center, icon_size, color);
+                }
             }
             if active {
                 shadow_text(
                     painter,
                     Pos2::new(anchor.x + 48.0, y - 6.0),
                     Align2::LEFT_CENTER,
-                    &truncate(&item.title, 42),
+                    &truncate(&title, 42),
                     FontId::proportional(22.0),
                     if item.available {
                         Color32::WHITE
@@ -1249,6 +2037,22 @@ impl XmbApp {
                         Color32::from_white_alpha(165),
                     );
                 }
+            } else {
+                // Neighbours keep their names, dimmer and smaller, so the
+                // column reads as a list rather than a stack of glyphs.
+                let alpha = (f32::from(opacity) * 0.68) as u8;
+                shadow_text(
+                    painter,
+                    Pos2::new(anchor.x + 44.0, y),
+                    Align2::LEFT_CENTER,
+                    &truncate(&title, 36),
+                    FontId::proportional(15.5),
+                    if item.available {
+                        Color32::from_white_alpha(alpha)
+                    } else {
+                        Color32::from_white_alpha(alpha.min(110))
+                    },
+                );
             }
         }
     }
@@ -1594,7 +2398,11 @@ impl XmbApp {
                 &clipped,
                 list.center(),
                 Align2::CENTER_CENTER,
-                if wifi_ui.refreshing { "Scanning…" } else { "No networks found" },
+                if wifi_ui.refreshing {
+                    "Scanning…"
+                } else {
+                    "No networks found"
+                },
                 FontId::proportional(14.0),
                 Color32::from_white_alpha(160),
             );
@@ -1670,7 +2478,10 @@ impl XmbApp {
         }
         shadow_text(
             painter,
-            Pos2::new(panel.left() + 22.0, panel.bottom() - footer_height / 2.0 - 2.0),
+            Pos2::new(
+                panel.left() + 22.0,
+                panel.bottom() - footer_height / 2.0 - 2.0,
+            ),
             Align2::LEFT_CENTER,
             &footer_line,
             FontId::proportional(11.0),
@@ -1743,6 +2554,11 @@ impl XmbApp {
         let Some(item) = item else {
             return;
         };
+        // An application icon is a glyph, not artwork; blown up in the
+        // corner it reads as a mistake. Only real art gets the preview.
+        if item.hero.is_none() && matches!(item.action, Action::Desktop(_)) {
+            return;
+        }
         let Some(path) = self.art_for(item) else {
             return;
         };
@@ -1778,7 +2594,10 @@ impl XmbApp {
                 Stroke::new(1.0, Color32::from_white_alpha(70)),
                 egui::StrokeKind::Inside,
             )
-            .with_texture(texture_id, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))),
+            .with_texture(
+                texture_id,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            ),
         );
     }
 
@@ -1815,6 +2634,11 @@ impl XmbApp {
                 color,
                 TextureOptions::LINEAR,
             );
+            // Cap the cache so a long desktop session cannot grow VRAM
+            // without bound; a rare full clear re-decodes only what's visible.
+            if self.textures.len() >= 160 {
+                self.textures.clear();
+            }
             self.textures.insert(key.clone(), texture);
         }
         self.textures.get(&key)
@@ -1843,6 +2667,81 @@ impl XmbApp {
         None
     }
 
+    /// Live controller tester: name + a grid of buttons that light up when
+    /// pressed. Same rounded-panel language as the Wi-Fi / info panels.
+    fn draw_controller_tester(&self, painter: &egui::Painter, rect: Rect) {
+        let accent = self.accent();
+        let states = self.controller.button_states();
+        let panel = Rect::from_center_size(rect.center(), Vec2::new(560.0, 380.0));
+        painter.rect_filled(panel, 12.0, Color32::from_black_alpha(215));
+        painter.rect_stroke(
+            panel,
+            12.0,
+            Stroke::new(1.0, Color32::from_white_alpha(70)),
+            egui::StrokeKind::Inside,
+        );
+        shadow_text(
+            painter,
+            Pos2::new(panel.left() + 22.0, panel.top() + 26.0),
+            Align2::LEFT_CENTER,
+            "CONTROLLER TEST",
+            FontId::proportional(12.0),
+            tint(accent, 220),
+        );
+        shadow_text(
+            painter,
+            Pos2::new(panel.right() - 22.0, panel.top() + 26.0),
+            Align2::RIGHT_CENTER,
+            "○ Back",
+            FontId::proportional(11.0),
+            Color32::from_white_alpha(130),
+        );
+        let name = self
+            .controller
+            .name
+            .clone()
+            .unwrap_or_else(|| "No controller connected".to_owned());
+        shadow_text(
+            painter,
+            Pos2::new(panel.center().x, panel.top() + 62.0),
+            Align2::CENTER_CENTER,
+            &truncate(&name, 42),
+            FontId::proportional(18.0),
+            Color32::WHITE,
+        );
+        // Two columns of button lamps.
+        let start_y = panel.top() + 104.0;
+        let row_h = 40.0;
+        for (index, (button, pressed)) in states.iter().enumerate() {
+            let col = index / 6;
+            let row = index % 6;
+            let x = panel.left() + 40.0 + col as f32 * (panel.width() / 2.0 - 20.0);
+            let y = start_y + row as f32 * row_h;
+            let lamp = Pos2::new(x, y);
+            let color = if *pressed {
+                accent
+            } else {
+                Color32::from_white_alpha(55)
+            };
+            painter.circle_filled(lamp, 8.0, color);
+            if *pressed {
+                painter.circle_filled(lamp, 13.0, tint(accent, 60));
+            }
+            shadow_text(
+                painter,
+                Pos2::new(x + 22.0, y),
+                Align2::LEFT_CENTER,
+                &sources::pretty_button(button),
+                FontId::proportional(14.0),
+                if *pressed {
+                    Color32::WHITE
+                } else {
+                    Color32::from_white_alpha(160)
+                },
+            );
+        }
+    }
+
     fn draw_footer(&self, painter: &egui::Painter, rect: Rect) {
         let text = if self
             .wifi
@@ -1854,6 +2753,12 @@ impl XmbApp {
             "× Select     ○ Back     △ Rescan"
         } else if self.options_open || self.submenu.is_some() {
             "× Select     ○ Back"
+        } else if self
+            .folders
+            .get(&self.state.mode)
+            .is_some_and(|stack| !stack.is_empty())
+        {
+            "× Enter     ○ Up     △ Options"
         } else {
             "× Enter     ○ Back     △ Options"
         };
@@ -2007,8 +2912,45 @@ impl XmbApp {
 impl eframe::App for XmbApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.update_runtime(ui.ctx());
-        for action in self.collect_input(ui.ctx()) {
-            self.handle_action(action, ui.ctx());
+        let actions = self.collect_input(ui.ctx());
+        let typing = self
+            .wifi
+            .as_ref()
+            .is_some_and(|wifi| wifi.password_for.is_some());
+        if !typing && ui.ctx().input(|input| input.key_pressed(Key::H)) {
+            self.help_open = !self.help_open;
+            self.feedback(if self.help_open {
+                Tone::Confirm
+            } else {
+                Tone::Back
+            });
+        }
+        if self.help_open {
+            if actions.iter().any(|action| {
+                matches!(
+                    action,
+                    InputAction::Back | InputAction::Confirm | InputAction::Context
+                )
+            }) {
+                self.help_open = false;
+                self.feedback(Tone::Back);
+            }
+        } else if self.rebind.is_some() {
+            self.handle_rebind(&actions);
+        } else if self.tester_open {
+            if actions.iter().any(|action| {
+                matches!(
+                    action,
+                    InputAction::Back | InputAction::Confirm | InputAction::Context
+                )
+            }) {
+                self.tester_open = false;
+                self.feedback(Tone::Back);
+            }
+        } else {
+            for action in actions {
+                self.handle_action(action, ui.ctx());
+            }
         }
         self.draw(ui);
     }
@@ -2158,8 +3100,11 @@ fn paint_background(
 ) {
     let inset = rect.shrink(1.0);
     if !skip_gradient {
-        let [top_alpha, bottom_alpha]: [u8; 2] =
-            if settings.transparent { [238, 246] } else { [255, 255] };
+        let [top_alpha, bottom_alpha]: [u8; 2] = if settings.transparent {
+            [238, 246]
+        } else {
+            [255, 255]
+        };
         let [top, bottom] = match pack_gradient {
             Some((top, bottom)) => [
                 Color32::from_rgba_premultiplied(top[0], top[1], top[2], top_alpha),
@@ -2186,11 +3131,23 @@ fn paint_background(
         Stroke::new(1.0, Color32::from_white_alpha(45)),
         egui::StrokeKind::Inside,
     );
+    // Behind the waves: the grid floor sits on the ground plane, the
+    // starfield fills the sky.
+    if settings.grid_floor {
+        paint_grid_floor(painter, rect, time, accent);
+    }
+    if settings.starfield {
+        paint_starfield(painter, rect, time, accent);
+    }
     if settings.waves {
         paint_wave_ribbons(painter, rect, time, accent);
         if settings.sparkles {
             paint_sparkles(painter, rect, time, accent);
         }
+    }
+    // In front of the waves: comets streak across the top.
+    if settings.comets {
+        paint_comets(painter, rect, time, accent);
     }
 }
 
@@ -2227,7 +3184,11 @@ fn paint_wave_ribbons(painter: &egui::Painter, rect: Rect, time: f32, accent: Co
             mesh.add_triangle(base + 1, base + 3, base + 2);
         }
         painter.add(Shape::mesh(mesh));
-        for (width, alpha) in [(4.6, crest_alpha / 4), (2.2, crest_alpha / 2), (1.1, crest_alpha)] {
+        for (width, alpha) in [
+            (4.6, crest_alpha / 4),
+            (2.2, crest_alpha / 2),
+            (1.1, crest_alpha),
+        ] {
             painter.add(Shape::line(
                 crest_points.clone(),
                 Stroke::new(width, tint(accent, alpha)),
@@ -2254,6 +3215,136 @@ fn paint_sparkles(painter: &egui::Painter, rect: Rect, time: f32, accent: Color3
         let radius = 0.9 + hash * 1.6 + pulse * 0.7;
         painter.circle_filled(Pos2::new(x, y), radius + 1.6, tint(accent, alpha / 5));
         painter.circle_filled(Pos2::new(x, y), radius, tint(accent, alpha));
+    }
+}
+
+/// A cheap stable hash in [0,1) from an index seed, matching the sparkle
+/// field so every effect draws identically each frame.
+fn hash01(seed: f32) -> f32 {
+    (seed.sin() * 43758.547).fract().abs()
+}
+
+/// Parallax starfield behind the waves: three depth layers drifting at
+/// different speeds, each star twinkling on its own clock.
+fn paint_starfield(painter: &egui::Painter, rect: Rect, time: f32, accent: Color32) {
+    // (count, drift, base radius, brightness) per depth layer, far to near.
+    let layers = [
+        (40_usize, 0.006_f32, 0.7_f32, 120_u8),
+        (28, 0.013, 1.0, 170),
+        (18, 0.024, 1.4, 220),
+    ];
+    let star = Color32::from_rgb(
+        accent.r().saturating_add(30),
+        accent.g().saturating_add(30),
+        accent.b().saturating_add(40),
+    );
+    for (layer, (count, drift, radius, bright)) in layers.into_iter().enumerate() {
+        let base = layer as f32 * 97.13;
+        for index in 0..count {
+            let seed = base + index as f32 * 2.399963;
+            let hx = hash01(seed);
+            let hy = hash01(seed * 1.7 + 4.2);
+            // Wrap horizontally so the layer scrolls forever.
+            let unit = (hx + time * drift).fract();
+            let x = rect.left() + unit * rect.width();
+            let y = rect.top() + hy * rect.height() * 0.82;
+            let pulse = ((time * (0.6 + hx * 1.3) + seed).sin() * 0.5 + 0.5).powi(2);
+            let alpha = (f32::from(bright) * (0.35 + pulse * 0.65)) as u8;
+            let r = radius + pulse * 0.6;
+            painter.circle_filled(Pos2::new(x, y), r + 1.3, tint(star, alpha / 6));
+            painter.circle_filled(Pos2::new(x, y), r, tint(star, alpha));
+        }
+    }
+}
+
+/// Soft out-of-focus orbs rising and swaying, drawn as stacked low-alpha
+/// fills so the edges read as blur.
+/// Occasional shooting stars: each streak is dark most of its cycle, then
+/// crosses the upper field on a fading tail.
+fn paint_comets(painter: &egui::Painter, rect: Rect, time: f32, accent: Color32) {
+    // (period seconds, phase offset, y band, direction)
+    let comets = [
+        (11.0_f32, 0.0_f32, 0.18_f32, 1.0_f32),
+        (17.0, 6.5, 0.30, 1.0),
+        (23.0, 13.0, 0.12, -1.0),
+    ];
+    for (index, (period, offset, band, direction)) in comets.into_iter().enumerate() {
+        let phase = (((time + offset) % period) / period).clamp(0.0, 1.0);
+        // Visible for the first third of the cycle only.
+        if phase > 0.34 {
+            continue;
+        }
+        let travel = phase / 0.34;
+        let span = rect.width() * 0.5;
+        let start_x = if direction > 0.0 {
+            rect.left() - span * 0.2
+        } else {
+            rect.right() + span * 0.2
+        };
+        let head_x = start_x + direction * travel * (rect.width() + span);
+        let head_y = rect.top() + rect.height() * band + travel * rect.height() * 0.12;
+        let tail = Vec2::new(-direction * span * 0.5, -rect.height() * 0.06);
+        let head = Pos2::new(head_x, head_y);
+        let seed = index as f32 * 12.9;
+        let base = tint(
+            accent,
+            ((1.0 - travel) * 200.0 + hash01(seed) * 20.0).clamp(0.0, 255.0) as u8,
+        );
+        // Fading tail: a few segments dimming toward the origin.
+        for step in 1..=6 {
+            let t0 = step as f32 / 6.0;
+            let t1 = (step as f32 - 1.0) / 6.0;
+            let a = (base.a() as f32 * (1.0 - t0)) as u8;
+            painter.line_segment(
+                [head + tail * t0, head + tail * t1],
+                Stroke::new(2.0, tint(accent, a)),
+            );
+        }
+        painter.circle_filled(head, 2.6, base);
+        painter.circle_filled(head, 5.0, tint(accent, base.a() / 4));
+    }
+}
+
+/// A perspective grid on the lower third, receding to a horizon and
+/// scrolling toward the viewer — the classic console floor.
+fn paint_grid_floor(painter: &egui::Painter, rect: Rect, time: f32, accent: Color32) {
+    let horizon = rect.top() + rect.height() * 0.66;
+    let bottom = rect.bottom();
+    let vanish_x = rect.center().x;
+    let depth = bottom - horizon;
+    if depth <= 1.0 {
+        return;
+    }
+    // Vertical rails converging on the vanishing point.
+    let rails = 10;
+    for i in -rails..=rails {
+        let frac = i as f32 / rails as f32;
+        let base_x = vanish_x + frac * rect.width() * 1.15;
+        let top = Pos2::new(vanish_x + frac * rect.width() * 0.05, horizon);
+        let alpha = (70.0 * (1.0 - frac.abs() * 0.5)).max(0.0) as u8;
+        painter.line_segment(
+            [top, Pos2::new(base_x, bottom)],
+            Stroke::new(1.0, tint(accent, alpha)),
+        );
+    }
+    // Horizontal rungs bunching toward the horizon, scrolling forward.
+    let scroll = time * 0.15;
+    for row in 0..14 {
+        // Exponential spacing: rows pile up near the horizon.
+        let t = ((row as f32 + scroll.fract()) / 14.0).fract();
+        let y = horizon + t * t * depth;
+        if y <= horizon || y >= bottom {
+            continue;
+        }
+        let width_at = rect.width() * (0.05 + t * 1.1);
+        let alpha = (75.0 * t).clamp(0.0, 75.0) as u8;
+        painter.line_segment(
+            [
+                Pos2::new(vanish_x - width_at, y),
+                Pos2::new(vanish_x + width_at, y),
+            ],
+            Stroke::new(1.0, tint(accent, alpha)),
+        );
     }
 }
 
@@ -2302,7 +3393,13 @@ fn shadow_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: f32, col
     paint_category_icon(painter, mode, center, size, color);
 }
 
-fn paint_category_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: f32, color: Color32) {
+fn paint_category_icon(
+    painter: &egui::Painter,
+    mode: Mode,
+    center: Pos2,
+    size: f32,
+    color: Color32,
+) {
     let unit = size / 2.0;
     let stroke = Stroke::new((size * 0.075).max(1.4), color);
     match mode {
@@ -2323,7 +3420,7 @@ fn paint_category_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: 
                 );
             }
         }
-        Mode::Extras => {
+        Mode::Apps => {
             // Application drawer: 2×2 rounded tiles.
             let tile = unit * 0.72;
             let gap = unit * 0.18;
@@ -2337,6 +3434,27 @@ fn paint_category_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: 
                 );
             }
         }
+        Mode::Extras => {
+            // Four-point spark: the "something extra" mark.
+            let long = unit * 0.95;
+            let short = unit * 0.26;
+            let star = vec![
+                center + Vec2::new(0.0, -long),
+                center + Vec2::new(short, -short),
+                center + Vec2::new(long, 0.0),
+                center + Vec2::new(short, short),
+                center + Vec2::new(0.0, long),
+                center + Vec2::new(-short, short),
+                center + Vec2::new(-long, 0.0),
+                center + Vec2::new(-short, -short),
+            ];
+            painter.add(Shape::closed_line(star, stroke));
+            painter.circle_filled(
+                center + Vec2::new(unit * 0.66, -unit * 0.66),
+                size * 0.06,
+                color,
+            );
+        }
         Mode::Photo => {
             // Framed landscape: border, sun, two peaks.
             let frame = Rect::from_center_size(center, Vec2::new(size * 0.98, size * 0.78));
@@ -2349,9 +3467,18 @@ fn paint_category_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: 
             let floor = frame.bottom() - stroke.width;
             let points = vec![
                 Pos2::new(frame.left() + frame.width() * 0.1, floor),
-                Pos2::new(frame.left() + frame.width() * 0.38, floor - frame.height() * 0.42),
-                Pos2::new(frame.left() + frame.width() * 0.58, floor - frame.height() * 0.14),
-                Pos2::new(frame.left() + frame.width() * 0.74, floor - frame.height() * 0.34),
+                Pos2::new(
+                    frame.left() + frame.width() * 0.38,
+                    floor - frame.height() * 0.42,
+                ),
+                Pos2::new(
+                    frame.left() + frame.width() * 0.58,
+                    floor - frame.height() * 0.14,
+                ),
+                Pos2::new(
+                    frame.left() + frame.width() * 0.74,
+                    floor - frame.height() * 0.34,
+                ),
                 Pos2::new(frame.right() - frame.width() * 0.08, floor),
             ];
             painter.add(Shape::line(points, stroke));
@@ -2375,8 +3502,10 @@ fn paint_category_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: 
             painter.rect_stroke(frame, size * 0.06, stroke, egui::StrokeKind::Middle);
             for row in 0..3 {
                 let y = frame.top() + frame.height() * (0.22 + row as f32 * 0.28);
-                for edge in [frame.left() + frame.width() * 0.12, frame.right() - frame.width() * 0.12]
-                {
+                for edge in [
+                    frame.left() + frame.width() * 0.12,
+                    frame.right() - frame.width() * 0.12,
+                ] {
                     painter.rect_filled(
                         Rect::from_center_size(Pos2::new(edge, y), Vec2::splat(size * 0.085)),
                         1.0,
@@ -2397,8 +3526,14 @@ fn paint_category_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: 
             painter.rect_stroke(body, body.height() * 0.45, stroke, egui::StrokeKind::Middle);
             let pad = center + Vec2::new(-unit * 0.48, 0.0);
             let arm = unit * 0.24;
-            painter.line_segment([pad - Vec2::new(arm, 0.0), pad + Vec2::new(arm, 0.0)], stroke);
-            painter.line_segment([pad - Vec2::new(0.0, arm), pad + Vec2::new(0.0, arm)], stroke);
+            painter.line_segment(
+                [pad - Vec2::new(arm, 0.0), pad + Vec2::new(arm, 0.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [pad - Vec2::new(0.0, arm), pad + Vec2::new(0.0, arm)],
+                stroke,
+            );
             let buttons = center + Vec2::new(unit * 0.48, 0.0);
             for direction in [
                 Vec2::new(0.0, -1.0),
@@ -2414,7 +3549,10 @@ fn paint_category_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: 
             let radius = unit * 0.8;
             painter.circle_stroke(center, radius, stroke);
             painter.line_segment(
-                [center - Vec2::new(radius, 0.0), center + Vec2::new(radius, 0.0)],
+                [
+                    center - Vec2::new(radius, 0.0),
+                    center + Vec2::new(radius, 0.0),
+                ],
                 stroke,
             );
             let arc = |squeeze: f32| {
@@ -2429,6 +3567,79 @@ fn paint_category_icon(painter: &egui::Painter, mode: Mode, center: Pos2, size: 
             };
             painter.add(Shape::closed_line(arc(0.42), stroke));
         }
+    }
+}
+
+/// A folder in the media columns: body with a tab.
+fn paint_folder_icon(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let stroke = Stroke::new((size * 0.075).max(1.4), color);
+    let body = Rect::from_center_size(
+        center + Vec2::new(0.0, size * 0.06),
+        Vec2::new(size * 0.98, size * 0.62),
+    );
+    painter.rect_stroke(body, size * 0.08, stroke, egui::StrokeKind::Middle);
+    let tab = Rect::from_min_size(
+        Pos2::new(body.left(), body.top() - size * 0.16),
+        Vec2::new(size * 0.42, size * 0.2),
+    );
+    painter.rect_filled(tab, size * 0.05, color);
+}
+
+/// Extras rows get their own glyphs; returns false for unknown ids so the
+/// caller can fall back to the category icon.
+fn paint_extra_icon(
+    painter: &egui::Painter,
+    id: &str,
+    center: Pos2,
+    size: f32,
+    color: Color32,
+) -> bool {
+    let unit = size / 2.0;
+    let stroke = Stroke::new((size * 0.075).max(1.4), color);
+    match id {
+        "extras:clock" => {
+            painter.circle_stroke(center, unit * 0.82, stroke);
+            painter.line_segment([center, center + Vec2::new(0.0, -unit * 0.5)], stroke);
+            painter.line_segment([center, center + Vec2::new(unit * 0.36, 0.0)], stroke);
+            painter.circle_filled(center, size * 0.05, color);
+            true
+        }
+        "system:information" => {
+            painter.circle_stroke(center, unit * 0.82, stroke);
+            painter.circle_filled(center + Vec2::new(0.0, -unit * 0.38), size * 0.06, color);
+            painter.line_segment(
+                [
+                    center + Vec2::new(0.0, -unit * 0.12),
+                    center + Vec2::new(0.0, unit * 0.42),
+                ],
+                Stroke::new(stroke.width * 1.3, color),
+            );
+            true
+        }
+        "extras:screen-off" => {
+            let screen = Rect::from_center_size(
+                center + Vec2::new(0.0, -unit * 0.1),
+                Vec2::new(size * 0.98, size * 0.64),
+            );
+            painter.rect_stroke(screen, size * 0.06, stroke, egui::StrokeKind::Middle);
+            painter.line_segment(
+                [
+                    center + Vec2::new(-unit * 0.3, unit * 0.62),
+                    center + Vec2::new(unit * 0.3, unit * 0.62),
+                ],
+                stroke,
+            );
+            painter.circle_stroke(screen.center(), unit * 0.22, stroke);
+            painter.line_segment(
+                [
+                    screen.center() + Vec2::new(0.0, -unit * 0.28),
+                    screen.center() + Vec2::new(0.0, -unit * 0.02),
+                ],
+                stroke,
+            );
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2536,6 +3747,39 @@ fn draw_signal_bars(painter: &egui::Painter, anchor: Pos2, bars: u8, color: Colo
     }
 }
 
+fn draw_rebind_overlay(
+    painter: &egui::Painter,
+    rect: Rect,
+    target: BindingTarget,
+    accent: Color32,
+) {
+    painter.rect_filled(rect.shrink(1.0), 26.0, Color32::from_black_alpha(150));
+    let panel = Rect::from_center_size(rect.center(), Vec2::new(460.0, 160.0));
+    painter.rect_filled(panel, 12.0, Color32::from_black_alpha(230));
+    painter.rect_stroke(
+        panel,
+        12.0,
+        Stroke::new(1.0, tint(accent, 150)),
+        egui::StrokeKind::Inside,
+    );
+    shadow_text(
+        painter,
+        Pos2::new(panel.center().x, panel.top() + 52.0),
+        Align2::CENTER_CENTER,
+        &format!("Press a button for {}", target.label()),
+        FontId::proportional(22.0),
+        Color32::WHITE,
+    );
+    shadow_text(
+        painter,
+        Pos2::new(panel.center().x, panel.bottom() - 46.0),
+        Align2::CENTER_CENTER,
+        "○ / Esc  Cancel",
+        FontId::proportional(15.0),
+        Color32::from_white_alpha(180),
+    );
+}
+
 fn draw_toast(painter: &egui::Painter, rect: Rect, message: &str) {
     let width = (message.chars().count() as f32 * 8.5 + 56.0).clamp(220.0, 560.0);
     let panel = Rect::from_center_size(
@@ -2566,7 +3810,6 @@ fn adjust_setting(action: SettingAction, settings: &mut Settings) {
         SettingAction::BackgroundMode => {
             settings.background_mode = match settings.background_mode.as_str() {
                 "gradient" => "picture",
-                "picture" => "wallpaper",
                 _ => "gradient",
             }
             .to_owned();
@@ -2582,14 +3825,55 @@ fn adjust_setting(action: SettingAction, settings: &mut Settings) {
                     .cloned(),
             };
         }
-        SettingAction::WallpaperScene => {}
         SettingAction::Sparkles => settings.sparkles = !settings.sparkles,
+        SettingAction::Starfield => settings.starfield = !settings.starfield,
+        SettingAction::Comets => settings.comets = !settings.comets,
+        SettingAction::GridFloor => settings.grid_floor = !settings.grid_floor,
+        // Handled by the launcher: it needs the generated wallpaper list.
+        SettingAction::DefaultBackground => {}
         SettingAction::SoundVolume => {
             let step = ((settings.sound_volume * 4.0).round() as u32 + 1) % 5;
             settings.sound_volume = step as f32 / 4.0;
         }
         SettingAction::BootAnimation => settings.boot_animation = !settings.boot_animation,
         SettingAction::Clock24h => settings.clock_24h = !settings.clock_24h,
+        SettingAction::IdleClock => {
+            const STEPS: [u8; 6] = [0, 2, 5, 10, 15, 30];
+            let index = STEPS
+                .iter()
+                .position(|step| *step >= settings.idle_clock_minutes)
+                .unwrap_or(0);
+            settings.idle_clock_minutes = STEPS[(index + 1) % STEPS.len()];
+        }
+        // Handled by the launcher: it needs the persisted state, not settings.
+        SettingAction::RestoreHidden => {}
+        SettingAction::StickDeadzone => {
+            const STEPS: [f32; 5] = [0.10, 0.20, 0.35, 0.45, 0.60];
+            let index = STEPS
+                .iter()
+                .position(|step| (step - settings.stick_deadzone).abs() < 0.001)
+                .unwrap_or(2);
+            settings.stick_deadzone = STEPS[(index + 1) % STEPS.len()];
+        }
+        SettingAction::NavRepeat => {
+            const STEPS: [u16; 4] = [0, 320, 200, 120];
+            let index = STEPS
+                .iter()
+                .position(|step| *step == settings.nav_repeat_ms)
+                .unwrap_or(0);
+            settings.nav_repeat_ms = STEPS[(index + 1) % STEPS.len()];
+        }
+        SettingAction::Rumble => settings.rumble = !settings.rumble,
+        SettingAction::RumbleStrength => {
+            const STEPS: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
+            let index = STEPS
+                .iter()
+                .position(|step| (step - settings.rumble_strength).abs() < 0.01)
+                .unwrap_or(1);
+            settings.rumble_strength = STEPS[(index + 1) % STEPS.len()];
+        }
+        // App-level: handled in confirm_submenu_item, not here.
+        SettingAction::TestController | SettingAction::ResetController => {}
         SettingAction::ResetAppearance => {
             let defaults = Settings::default();
             settings.theme = defaults.theme;
@@ -2601,7 +3885,11 @@ fn adjust_setting(action: SettingAction, settings: &mut Settings) {
             settings.background_mode = defaults.background_mode;
             settings.theme_pack = None;
             settings.sparkles = defaults.sparkles;
+            settings.starfield = defaults.starfield;
+            settings.comets = defaults.comets;
+            settings.grid_floor = defaults.grid_floor;
             settings.boot_animation = defaults.boot_animation;
+            settings.idle_clock_minutes = defaults.idle_clock_minutes;
         }
         SettingAction::Binding(target) => settings.controller.cycle(target),
     }
